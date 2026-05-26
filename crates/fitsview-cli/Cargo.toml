@@ -1,0 +1,21 @@
+[package]
+name = "fitsview-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "fits-view"
+path = "src/main.rs"
+
+[features]
+default = ["gpu"]
+gpu = ["fitsview-gui/gpu"]
+cpu-only = ["fitsview-gui/cpu-only"]
+
+[dependencies]
+fitsview-core = { path = "../fitsview-core" }
+fitsview-gui = { path = "../fitsview-gui", default-features = false }
+clap = { version = "4", features = ["derive"] }
+anyhow = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }

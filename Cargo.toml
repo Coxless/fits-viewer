@@ -1,0 +1,14 @@
+[workspace]
+members = [
+    "crates/fitsview-core",
+    "crates/fitsview-gui",
+    "crates/fitsview-cli",
+]
+resolver = "2"
+
+[workspace.dependencies]
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
