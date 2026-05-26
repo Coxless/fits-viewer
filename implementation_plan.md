@@ -285,6 +285,59 @@ crates/
   - `Split View Vertical`
   - `Split View Horizontal`
 
+#### 2-7b. イベントリスト（BINTABLE EVENTS）→ 画像変換
+
+ファイル：`crates/fitsview-core/src/event_image.rs`
+
+**背景**：X 線天文衛星（Suzaku, Chandra, XMM-Newton など）の観測データは、イメージ HDU を持たず `BINTABLE` の `EVENTS` 拡張に光子 1 個ずつの `(X, Y, TIME, ENERGY, ...)` を格納する。これをビニングして 2D ヒストグラムを作り、画像として表示する。
+
+**空間列の自動検出**：
+
+| 優先順位 | 列名候補 | 用途 |
+|---|---|---|
+| 1 | `X`, `Y` | 検出器座標（Suzaku, Chandra） |
+| 2 | `DETX`, `DETY` | 検出器座標（XMM-Newton） |
+| 3 | `RA`, `DEC` | 天球座標（WCS ベース） |
+| 4 | `RAWX`, `RAWY` | 生 CCD 座標 |
+
+**実装内容**：
+
+```rust
+pub struct EventImage {
+    pub data: Vec<f32>,      // ビニング済みカウントマップ
+    pub width: usize,
+    pub height: usize,
+    pub bin_size: f64,        // ピクセル/ビン（デフォルト 1.0）
+    pub x_col: String,        // 使用した X 列名
+    pub y_col: String,        // 使用した Y 列名
+    pub total_events: usize,
+    pub header: HashMap<String, String>,
+}
+
+pub fn bin_events(path: &Path, hdu_index: usize, bin_size: f64) -> anyhow::Result<EventImage>
+```
+
+処理フロー：
+1. BINTABLE HDU のカラム一覧をスキャンし、空間列を優先順位で自動選択
+2. `(X_min, X_max, Y_min, Y_max)` を求めて出力画像サイズを決定（最大 4096×4096 に制限）
+3. `rayon::par_iter` で各イベントを 2D ヒストグラムにビニング
+4. `FitsImage` と同等の `Vec<f32>` カウントマップとして返す
+
+エネルギーフィルタリング（将来拡張のための API 設計のみ Step 2 で定義）：
+```rust
+pub struct EventFilter {
+    pub energy_range: Option<(f32, f32)>,  // keV
+    pub time_range: Option<(f64, f64)>,    // s
+}
+```
+
+**fitsview-gui 側対応**：
+
+- `app.rs` の `load_fits` の前段で HDU タイプを判定するディスパッチャーを追加
+- EVENTS BINTABLE を検出したら `bin_events` を呼び出し、結果を `FitsImage` として扱う
+- ステータスバーにイベントモード表示：`EVENTS | X/Y | 281万 events | bin=1.0`
+- ビンサイズ変更 UI：ステータスバーの `bin=` 表示をクリックで数値入力
+
 #### 2-8. `fits-view .` の実装
 
 - CLI で `.` または ディレクトリパスを受け取った場合、エクスプローラーをそのパスで開く
@@ -330,6 +383,8 @@ crates/fitsview-gui/src/
 - 縦・横分割で2ファイルを並べて表示できる
 - コマンドパレットでカラーマップを変更できる
 - 新ファイルをディレクトリに追加するとエクスプローラーが自動更新される
+- **`fits-view tests/fixtures/tycho.fits` でイベントリストがカウントマップ画像として表示される**
+- **イベントファイルでステータスバーに `EVENTS | X/Y | N events | bin=1.0` が表示される**
 
 ---
 
@@ -741,6 +796,8 @@ Step 0 → Step 1 → Step 2 → Step 3 → Step 4 → Step 5
 | リスク | 対策 |
 |---|---|
 | `fitsrs` が一部 FITS 方言に非対応 | 問題発生時は `fitsrs` に PR / フォーク、または独自パーサー部分実装 |
+| イベントリストの列名が衛星ごとに異なる | 優先順位付きの列名候補リストで対応。未検出時はユーザーが列を手動選択できる UI を追加 |
+| 大量イベント（1億件以上）のビニングが遅い | `rayon::par_iter` で並列化。Step 3 の `memmap2` と統合してゼロコピー読み込みに移行 |
 | WSL2 で wgpu が動作しない | Step 1〜2 は CPU-only で開発。Step 3 で GPU 追加時に WSL2 `/dev/dxg` 経由を検証 |
 | `memmap2` の Windows/WSL2 挙動差異 | `/mnt/c/` は回避し WSL2 ネイティブ FS で開発・テスト |
 | egui のカスタム UI 実装コスト | タブバー・ファイルエクスプローラーは egui の Painter API で自作。工数が大きい場合は既存 Widget を優先 |

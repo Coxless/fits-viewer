@@ -18,6 +18,7 @@ pub fn load_fits(path: &Path) -> anyhow::Result<FitsImage> {
     let mut hdu_list = Fits::from_reader(reader);
 
     // Find the first image HDU with actual pixel data (Primary HDU may have NAXIS=0)
+    let mut has_table = false;
     let hdu = loop {
         match hdu_list.next() {
             Some(Ok(HDU::Primary(h))) | Some(Ok(HDU::XImage(h))) => {
@@ -25,9 +26,17 @@ pub fn load_fits(path: &Path) -> anyhow::Result<FitsImage> {
                     break h;
                 }
             }
+            Some(Ok(HDU::XBinaryTable(_))) | Some(Ok(HDU::XASCIITable(_))) => {
+                has_table = true;
+            }
             Some(Ok(_)) => {}
             Some(Err(e)) => return Err(e.into()),
-            None => anyhow::bail!("No image data found in FITS file"),
+            None => {
+                if has_table {
+                    anyhow::bail!("FITS file contains table data (BINTABLE/TABLE) but no image HDU. Only image FITS files are supported.");
+                }
+                anyhow::bail!("No image data found in FITS file");
+            }
         }
     };
 

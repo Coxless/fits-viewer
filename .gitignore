@@ -1,0 +1,22 @@
+# Build output
+/target/
+
+# Test fixtures (keep only sample files)
+tests/fixtures/*.fits
+!tests/fixtures/sample*.fits
+tests/fixtures/*.fit
+!tests/fixtures/sample*.fit
+tests/fixtures/*.fts
+!tests/fixtures/sample*.fts
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Environment
+.env
+.env.local
