@@ -844,6 +844,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "eframe",
  "env_logger",
  "fitsview-core",
  "fitsview-gui",
