@@ -13,6 +13,145 @@ pub struct FitsImage {
     pub bitpix: i32,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum HduType {
+    Image,
+    BinTable,
+    AsciiTable,
+}
+
+#[derive(Debug, Clone)]
+pub struct HduInfo {
+    pub index: usize,
+    pub hdu_type: HduType,
+    pub name: String,
+    pub naxis: Vec<usize>,
+}
+
+/// List all HDUs in a FITS file without reading pixel data.
+pub fn list_hdus(path: &Path) -> anyhow::Result<Vec<HduInfo>> {
+    let reader = BufReader::new(File::open(path)?);
+    let hdu_list = Fits::from_reader(reader);
+    let mut result = Vec::new();
+
+    for (idx, hdu_result) in hdu_list.enumerate() {
+        let hdu = hdu_result?;
+        match hdu {
+            HDU::Primary(h) | HDU::XImage(h) => {
+                let xt = h.get_header().get_xtension();
+                let name = extract_header_str(h.get_header().iter(), "EXTNAME");
+                let naxis: Vec<usize> = xt.get_naxis().iter().map(|&n| n as usize).collect();
+                result.push(HduInfo { index: idx, hdu_type: HduType::Image, name, naxis });
+            }
+            HDU::XBinaryTable(h) => {
+                let xt = h.get_header().get_xtension();
+                let name = extract_header_str(h.get_header().iter(), "EXTNAME");
+                let naxis = vec![xt.get_num_rows()];
+                result.push(HduInfo { index: idx, hdu_type: HduType::BinTable, name, naxis });
+            }
+            HDU::XASCIITable(h) => {
+                let name = extract_header_str(h.get_header().iter(), "EXTNAME");
+                result.push(HduInfo {
+                    index: idx,
+                    hdu_type: HduType::AsciiTable,
+                    name,
+                    naxis: vec![],
+                });
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+fn extract_header_str<'a>(
+    iter: impl Iterator<Item = (&'a str, &'a fitsrs::card::Value)>,
+    key: &str,
+) -> String {
+    for (k, v) in iter {
+        if k == key {
+            if let fitsrs::card::Value::String { value, .. } = v {
+                return value.trim().to_owned();
+            }
+        }
+    }
+    String::new()
+}
+
+/// Load the image HDU at absolute position `hdu_index` (counting all HDU types from 0).
+pub fn load_fits_hdu(path: &Path, hdu_index: usize) -> anyhow::Result<FitsImage> {
+    let reader = BufReader::new(File::open(path)?);
+    let mut hdu_list = Fits::from_reader(reader);
+    let mut cur = 0usize;
+
+    loop {
+        match hdu_list.next() {
+            Some(Ok(HDU::Primary(h))) | Some(Ok(HDU::XImage(h))) => {
+                if cur == hdu_index {
+                    anyhow::ensure!(
+                        h.get_header().get_xtension().get_num_pixels() > 0,
+                        "HDU {hdu_index} is an image with no pixel data (NAXIS=0)"
+                    );
+                    return extract_image(h, &mut hdu_list);
+                }
+            }
+            Some(Ok(HDU::XBinaryTable(_))) | Some(Ok(HDU::XASCIITable(_))) => {
+                if cur == hdu_index {
+                    anyhow::bail!("HDU {hdu_index} is a table, not an image");
+                }
+            }
+            Some(Err(e)) => return Err(e.into()),
+            None => anyhow::bail!("HDU index {hdu_index} not found in file"),
+        }
+        cur += 1;
+    }
+}
+
+fn extract_image(
+    hdu: fitsrs::fits::HDU<fitsrs::hdu::header::extension::image::Image>,
+    hdu_list: &mut Fits<BufReader<File>>,
+) -> anyhow::Result<FitsImage> {
+    let xt = hdu.get_header().get_xtension();
+    let naxis = xt.get_naxis();
+    anyhow::ensure!(
+        naxis.len() >= 2,
+        "FITS image must have at least 2 axes, found {}",
+        naxis.len()
+    );
+    let width = naxis[0] as usize;
+    let height = naxis[1] as usize;
+    let bitpix = xt.get_bitpix() as i32;
+
+    let mut header = HashMap::new();
+    for (key, val) in hdu.get_header().iter() {
+        header.insert(key.to_owned(), value_to_string(val));
+    }
+
+    let img_data = hdu_list.get_data(&hdu);
+    let data: Vec<f32> = match img_data.pixels() {
+        Pixels::U8(it) => it.map(|v| v as f32).collect(),
+        Pixels::I16(it) => it.map(|v| v as f32).collect(),
+        Pixels::I32(it) => it.map(|v| v as f32).collect(),
+        Pixels::I64(it) => it.map(|v| v as f32).collect(),
+        Pixels::F32(it) => it.collect(),
+        Pixels::F64(it) => it.map(|v| v as f32).collect(),
+    };
+
+    Ok(FitsImage { data, width, height, header, bitpix })
+}
+
+fn value_to_string(val: &fitsrs::card::Value) -> String {
+    use fitsrs::card::Value;
+    match val {
+        Value::Integer { value: v, .. } => v.to_string(),
+        Value::Float { value: v, .. } => format!("{v:.10}"),
+        Value::Logical { value: v, .. } => if *v { "T" } else { "F" }.to_owned(),
+        Value::String { value: v, .. } => v.clone(),
+        Value::Undefined => String::new(),
+        Value::Invalid(s) => s.clone(),
+    }
+}
+
 pub fn load_fits(path: &Path) -> anyhow::Result<FitsImage> {
     let reader = BufReader::new(File::open(path)?);
     let mut hdu_list = Fits::from_reader(reader);
@@ -29,7 +168,6 @@ pub fn load_fits(path: &Path) -> anyhow::Result<FitsImage> {
             Some(Ok(HDU::XBinaryTable(_))) | Some(Ok(HDU::XASCIITable(_))) => {
                 has_table = true;
             }
-            Some(Ok(_)) => {}
             Some(Err(e)) => return Err(e.into()),
             None => {
                 if has_table {
@@ -40,43 +178,7 @@ pub fn load_fits(path: &Path) -> anyhow::Result<FitsImage> {
         }
     };
 
-    let xt = hdu.get_header().get_xtension();
-    let naxis = xt.get_naxis();
-    anyhow::ensure!(
-        naxis.len() >= 2,
-        "FITS image must have at least 2 axes, found {}",
-        naxis.len()
-    );
-    let width = naxis[0] as usize;
-    let height = naxis[1] as usize;
-    let bitpix = xt.get_bitpix() as i32;
-
-    // Header<Image> derefs to ValueMap; .iter() yields (&str, &Value)
-    let mut header = HashMap::new();
-    for (key, val) in hdu.get_header().iter() {
-        use fitsrs::card::Value;
-        let s = match val {
-            Value::Integer { value: v, .. } => v.to_string(),
-            Value::Float { value: v, .. } => format!("{v:.10}"),
-            Value::Logical { value: v, .. } => if *v { "T" } else { "F" }.to_owned(),
-            Value::String { value: v, .. } => v.clone(),
-            Value::Undefined => String::new(),
-            Value::Invalid(s) => s.clone(),
-        };
-        header.insert(key.to_owned(), s);
-    }
-
-    let img_data = hdu_list.get_data(&hdu);
-    let data: Vec<f32> = match img_data.pixels() {
-        Pixels::U8(it) => it.map(|v| v as f32).collect(),
-        Pixels::I16(it) => it.map(|v| v as f32).collect(),
-        Pixels::I32(it) => it.map(|v| v as f32).collect(),
-        Pixels::I64(it) => it.map(|v| v as f32).collect(),
-        Pixels::F32(it) => it.collect(),
-        Pixels::F64(it) => it.map(|v| v as f32).collect(),
-    };
-
-    Ok(FitsImage { data, width, height, header, bitpix })
+    extract_image(hdu, &mut hdu_list)
 }
 
 #[cfg(test)]
