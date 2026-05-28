@@ -96,7 +96,7 @@ impl FileExplorer {
                         };
 
                         let resp = ui.add(egui::Label::new(text).sense(egui::Sense::click()));
-                        if is_fits && resp.double_clicked() {
+                        if is_fits && resp.clicked() {
                             to_open = Some(path.clone());
                         }
                         resp.context_menu(|ui| {
