@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::dir_watcher::{DirEvent, DirWatcher};
+use crate::theme;
 
 pub struct FileExplorer {
     pub visible: bool,
@@ -61,23 +62,30 @@ impl FileExplorer {
         egui::SidePanel::left("file_explorer")
             .default_width(220.0)
             .resizable(true)
+            .frame(theme::side_panel_frame())
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.heading("Explorer");
-                });
-                ui.separator();
+                // Panel header
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new("EXPLORER")
+                        .size(11.0)
+                        .color(theme::TEXT_MUTED)
+                        .strong(),
+                );
+                ui.add_space(2.0);
 
                 if let Some(root) = &self.root {
+                    let dir_name = root
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| root.to_string_lossy().into_owned());
                     ui.label(
-                        egui::RichText::new(
-                            root.file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| root.to_string_lossy().into_owned()),
-                        )
-                        .size(16.0)
-                        .weak(),
+                        egui::RichText::new(dir_name.to_uppercase())
+                            .size(12.0)
+                            .color(theme::TEXT_OVERLAY)
+                            .strong(),
                     );
-                    ui.separator();
+                    ui.add_space(4.0);
                 }
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
@@ -94,9 +102,9 @@ impl FileExplorer {
                                 .map(|m| {
                                     let b = m.len();
                                     if b >= 1 << 30 {
-                                        format!(" [{:.1}G]", b as f64 / (1u64 << 30) as f64)
+                                        format!("  {:.1}G", b as f64 / (1u64 << 30) as f64)
                                     } else if b >= 1 << 20 {
-                                        format!(" [{:.0}M]", b as f64 / (1u64 << 20) as f64)
+                                        format!("  {:.0}M", b as f64 / (1u64 << 20) as f64)
                                     } else {
                                         String::new()
                                     }
@@ -105,13 +113,8 @@ impl FileExplorer {
                         } else {
                             String::new()
                         };
-                        let label_text = if is_fits {
-                            format!("📄 {name}{size_badge}")
-                        } else {
-                            format!("  {name}")
-                        };
-                        let font_id = egui::FontId::monospace(14.0);
-                        let row_height = 18.0;
+
+                        let row_height = 22.0;
                         let sense = if is_fits {
                             egui::Sense::click()
                         } else {
@@ -123,32 +126,62 @@ impl FileExplorer {
                         );
 
                         if ui.is_rect_visible(row_rect) {
-                            if is_fits && resp.hovered() {
-                                ui.painter().rect_filled(
-                                    row_rect,
-                                    2.0,
-                                    ui.visuals().widgets.hovered.weak_bg_fill,
+                            if resp.hovered() && is_fits {
+                                ui.painter().rect_filled(row_rect, 4.0, theme::BG_HOVER);
+                            }
+
+                            if is_fits {
+                                // Accent left bar for FITS files
+                                let bar_rect = egui::Rect::from_min_size(
+                                    row_rect.left_top(),
+                                    egui::vec2(2.0, row_height),
+                                );
+                                ui.painter().rect_filled(bar_rect, egui::Rounding::ZERO, theme::ACCENT_DIM);
+
+                                let icon_color = if resp.hovered() { theme::ACCENT } else { theme::ACCENT_DIM };
+                                ui.painter().text(
+                                    egui::pos2(row_rect.left() + 10.0, row_rect.center().y),
+                                    egui::Align2::LEFT_CENTER,
+                                    "◆",
+                                    egui::FontId::proportional(9.0),
+                                    icon_color,
+                                );
+                                let text_x = row_rect.left() + 22.0;
+                                let text_color = if resp.hovered() { theme::TEXT_PRIMARY } else { theme::TEXT_OVERLAY };
+                                ui.painter().text(
+                                    egui::pos2(text_x, row_rect.center().y),
+                                    egui::Align2::LEFT_CENTER,
+                                    &name,
+                                    egui::FontId::monospace(13.0),
+                                    text_color,
+                                );
+                                if !size_badge.is_empty() {
+                                    let name_w = ctx.fonts(|f| {
+                                        f.layout_no_wrap(
+                                            name.clone(),
+                                            egui::FontId::monospace(13.0),
+                                            egui::Color32::WHITE,
+                                        ).rect.width()
+                                    });
+                                    ui.painter().text(
+                                        egui::pos2(text_x + name_w, row_rect.center().y),
+                                        egui::Align2::LEFT_CENTER,
+                                        &size_badge,
+                                        egui::FontId::monospace(11.0),
+                                        theme::TEXT_MUTED,
+                                    );
+                                }
+                            } else {
+                                ui.painter().text(
+                                    egui::pos2(row_rect.left() + 10.0, row_rect.center().y),
+                                    egui::Align2::LEFT_CENTER,
+                                    &name,
+                                    egui::FontId::monospace(13.0),
+                                    theme::TEXT_MUTED,
                                 );
                             }
-                            let text_color = if is_fits {
-                                ui.visuals().text_color()
-                            } else {
-                                ui.visuals().weak_text_color()
-                            };
-                            ui.painter().text(
-                                egui::pos2(row_rect.left() + 4.0, row_rect.center().y),
-                                egui::Align2::LEFT_CENTER,
-                                label_text,
-                                font_id,
-                                text_color,
-                            );
                         }
 
-                        let resp = if is_fits {
-                            resp.on_hover_cursor(egui::CursorIcon::Default)
-                        } else {
-                            resp
-                        };
                         if is_fits && resp.clicked() {
                             to_open = Some(path.clone());
                         }

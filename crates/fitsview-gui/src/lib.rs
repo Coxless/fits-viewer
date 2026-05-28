@@ -9,4 +9,5 @@ pub mod split_view;
 pub mod stats_panel;
 pub mod status_bar;
 pub mod tab_manager;
+pub mod theme;
 pub mod viewport;

@@ -26,6 +26,7 @@ use crate::{
     stats_panel::StatsPanel,
     status_bar::StatusBar,
     tab_manager::{FileData, LargeImageState, Tab, TabManager},
+    theme,
     viewport::ViewState,
 };
 
@@ -80,6 +81,8 @@ impl FitsViewApp {
         initial_paths: Vec<PathBuf>,
         initial_dir: Option<PathBuf>,
     ) -> Self {
+        theme::apply(&cc.egui_ctx);
+
         let tokio_rt = Arc::new(tokio::runtime::Runtime::new().expect("tokio runtime"));
         let tile_loader = TileLoader::new(&tokio_rt);
         let tile_manager = TileManager::new(TileManager::MAX_MEMORY);

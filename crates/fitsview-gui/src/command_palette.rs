@@ -1,3 +1,4 @@
+use crate::theme;
 use fitsview_core::{colormap::Colormap, scale::ScaleMode};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -107,19 +108,29 @@ impl CommandPalette {
             .title_bar(false)
             .resizable(false)
             .collapsible(false)
-            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 60.0))
-            .fixed_size(egui::vec2(480.0, 320.0))
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 72.0))
+            .fixed_size(egui::vec2(520.0, 340.0))
+            .frame(theme::modal_frame())
             .show(ctx, |ui| {
+                // Search input with accent-colored bottom border effect
                 let input_resp = ui.add(
                     egui::TextEdit::singleline(&mut self.query)
-                        .hint_text("Type a command...")
-                        .desired_width(f32::INFINITY),
+                        .hint_text("Search commands…")
+                        .desired_width(f32::INFINITY)
+                        .font(egui::FontId::new(15.0, egui::FontFamily::Proportional)),
                 );
 
                 if self.just_opened {
                     input_resp.request_focus();
                     self.just_opened = false;
                 }
+
+                // Accent underline on input field
+                let ir = input_resp.rect;
+                ui.painter().line_segment(
+                    [ir.left_bottom(), ir.right_bottom()],
+                    egui::Stroke::new(2.0, theme::ACCENT),
+                );
 
                 if input_resp.lost_focus()
                     && ctx.input(|i| i.key_pressed(egui::Key::Escape))
@@ -132,6 +143,8 @@ impl CommandPalette {
                         close = true;
                     }
                 });
+
+                ui.add_space(6.0);
 
                 let query_lower = self.query.to_ascii_lowercase();
                 let filtered: Vec<&Command> = ALL_COMMANDS
@@ -163,11 +176,27 @@ impl CommandPalette {
                 });
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
                     for (i, &cmd) in filtered.iter().enumerate() {
                         let is_selected = i == self.selected;
-                        let label = egui::RichText::new(cmd.label()).monospace();
-                        let label = if is_selected { label.strong() } else { label };
-                        let resp = ui.add(egui::Label::new(label).sense(egui::Sense::click()));
+
+                        let bg = if is_selected { theme::BG_HOVER } else { egui::Color32::TRANSPARENT };
+                        let text_color = if is_selected { theme::TEXT_PRIMARY } else { theme::TEXT_OVERLAY };
+
+                        let label = egui::RichText::new(cmd.label())
+                            .size(13.5)
+                            .color(text_color);
+
+                        let resp = egui::Frame::none()
+                            .fill(bg)
+                            .rounding(egui::Rounding::same(4.0))
+                            .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.add(egui::Label::new(label).sense(egui::Sense::click()))
+                            })
+                            .inner;
+
                         if resp.hovered() {
                             self.selected = i;
                         }
