@@ -8,12 +8,10 @@ fitsrs = "0.4"
 memmap2 = "0.9"
 rayon = "1"
 flate2 = "1"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync"] }
 lru = "0.12"
 anyhow = { workspace = true }
 log = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
 
 [dev-dependencies]
 env_logger = { workspace = true }

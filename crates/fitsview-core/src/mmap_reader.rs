@@ -128,6 +128,11 @@ impl MmapFitsImage {
             for ox in 0..out_w {
                 let col = (col_start + ox * scale).min(self.width - 1);
                 let byte_pos = self.data_offset as usize + (row * self.width + col) * bpp;
+                anyhow::ensure!(
+                    byte_pos + bpp <= self.mmap.len(),
+                    "pixel byte offset {}+{} exceeds mmap length {}",
+                    byte_pos, bpp, self.mmap.len()
+                );
                 let slice = &self.mmap[byte_pos..byte_pos + bpp];
                 out.push(bitpix_to_f32(slice, self.bitpix));
             }
@@ -150,6 +155,11 @@ impl MmapFitsImage {
         for row in row0..row0 + th {
             let byte_start = self.data_offset as usize + (row * self.width + col0) * bpp;
             let byte_end = byte_start + tw * bpp;
+            anyhow::ensure!(
+                byte_end <= self.mmap.len(),
+                "row byte range {}..{} exceeds mmap length {}",
+                byte_start, byte_end, self.mmap.len()
+            );
             let slice = &self.mmap[byte_start..byte_end];
             decode_row(slice, self.bitpix, tw, &mut out);
         }

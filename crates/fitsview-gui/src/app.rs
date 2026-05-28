@@ -526,7 +526,7 @@ impl FitsViewApp {
 
         let painter = ui.painter();
 
-        if let Some(ref texture) = &tab.texture.clone() {
+        if let Some(texture) = &tab.texture {
             let img_size = vec2(tab.data.width() as f32, tab.data.height() as f32);
             let display_size = img_size * tab.view.zoom;
             let display_origin = available.min.to_vec2() + tab.view.offset * tab.view.zoom;

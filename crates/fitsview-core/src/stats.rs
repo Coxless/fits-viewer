@@ -45,7 +45,7 @@ pub fn compute_stats(data: &[f32]) -> ImageStats {
     let std_dev = (sum_sq_dev / n_finite as f64).sqrt();
 
     // Median via sort
-    finite.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+    finite.sort_unstable_by(|a, b| a.total_cmp(b));
     let median = if n_finite % 2 == 1 {
         finite[n_finite / 2]
     } else {

@@ -96,7 +96,7 @@ fn zscale(finite: &[f32]) -> ScaleResult {
     // Uniform stride sampling
     let stride = (finite.len() / n).max(1);
     let mut samples: Vec<f32> = finite.iter().copied().step_by(stride).take(n).collect();
-    samples.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+    samples.sort_unstable_by(|a, b| a.total_cmp(b));
 
     let n = samples.len();
     if n < 2 {
