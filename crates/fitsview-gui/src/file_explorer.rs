@@ -67,7 +67,7 @@ impl FileExplorer {
                 });
                 ui.separator();
 
-                if let Some(root) = &self.root.clone() {
+                if let Some(root) = &self.root {
                     ui.label(
                         egui::RichText::new(
                             root.file_name()
@@ -81,8 +81,7 @@ impl FileExplorer {
                 }
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    let entries = self.entries.clone();
-                    for path in &entries {
+                    for path in &self.entries {
                         let name = path
                             .file_name()
                             .map(|n| n.to_string_lossy().into_owned())

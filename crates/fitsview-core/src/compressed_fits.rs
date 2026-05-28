@@ -260,6 +260,7 @@ fn extract_compressed_bytes<'a>(
     let col_start = info.comp_col_offset;
     if info.is_variable {
         // P descriptor: count (i32 BE) + heap_offset (i32 BE)
+        anyhow::ensure!(col_start + 8 <= row.len(), "P descriptor out of row bounds");
         let p = &row[col_start..col_start + 8];
         let count_i = i32::from_be_bytes([p[0], p[1], p[2], p[3]]);
         let off_i   = i32::from_be_bytes([p[4], p[5], p[6], p[7]]);
@@ -322,9 +323,11 @@ fn bytes_to_f32(raw: &[u8], n_pixels: usize, zbitpix: i32) -> anyhow::Result<Vec
         32 => raw.chunks_exact(4).take(n_pixels).map(|b| i32::from_be_bytes([b[0], b[1], b[2], b[3]]) as f32).collect(),
         -32 => raw.chunks_exact(4).take(n_pixels).map(|b| f32::from_be_bytes([b[0], b[1], b[2], b[3]])).collect(),
         64 => raw.chunks_exact(8).take(n_pixels)
-            .map(|b| i64::from_be_bytes(b.try_into().unwrap()) as f32).collect(),
+            .map(|b| i64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f32)
+            .collect(),
         -64 => raw.chunks_exact(8).take(n_pixels)
-            .map(|b| f64::from_be_bytes(b.try_into().unwrap()) as f32).collect(),
+            .map(|b| f64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f32)
+            .collect(),
         _ => anyhow::bail!("Unsupported ZBITPIX: {zbitpix}"),
     };
     Ok(out)
