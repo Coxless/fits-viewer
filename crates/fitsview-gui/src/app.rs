@@ -580,7 +580,7 @@ fn build_texture(ctx: &egui::Context, tab: &mut Tab) -> TextureHandle {
         tab.scale_result = Some(compute_scale(data, tab.scale_mode));
     }
     let sr = tab.scale_result.as_ref().unwrap();
-    let rgba = render_to_rgba(data, sr.vmin, sr.vmax, tab.colormap);
+    let rgba = render_to_rgba(data, sr.vmin, sr.vmax, tab.colormap, tab.scale_mode);
     let w = tab.data.width();
     let h = tab.data.height();
     let ci = ColorImage::from_rgba_unmultiplied([w, h], &rgba);

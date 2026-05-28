@@ -1,5 +1,7 @@
 use std::sync::OnceLock;
 
+use crate::scale::{apply_transfer, ScaleMode};
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Colormap {
     Gray,
@@ -23,11 +25,11 @@ pub fn apply_colormap(value: f32, cmap: Colormap) -> [u8; 4] {
     [r, g, b, 255]
 }
 
-pub fn render_to_rgba(data: &[f32], vmin: f32, vmax: f32, cmap: Colormap) -> Vec<u8> {
+pub fn render_to_rgba(data: &[f32], vmin: f32, vmax: f32, cmap: Colormap, scale_mode: ScaleMode) -> Vec<u8> {
     let range = (vmax - vmin).max(f32::EPSILON);
     let mut rgba = Vec::with_capacity(data.len() * 4);
     for &v in data {
-        let t = ((v - vmin) / range).clamp(0.0, 1.0);
+        let t = apply_transfer(((v - vmin) / range).clamp(0.0, 1.0), scale_mode);
         let [r, g, b, a] = apply_colormap(t, cmap);
         rgba.extend_from_slice(&[r, g, b, a]);
     }
@@ -186,7 +188,7 @@ mod tests {
     #[test]
     fn test_render_to_rgba_length() {
         let data = vec![0.0_f32, 0.5, 1.0];
-        let result = render_to_rgba(&data, 0.0, 1.0, Colormap::Viridis);
+        let result = render_to_rgba(&data, 0.0, 1.0, Colormap::Viridis, crate::scale::ScaleMode::Linear);
         assert_eq!(result.len(), 12);
     }
 

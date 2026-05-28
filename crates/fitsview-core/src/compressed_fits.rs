@@ -39,6 +39,8 @@ pub fn is_tile_compressed(path: &Path) -> anyhow::Result<bool> {
 // ---------------------------------------------------------------------------
 // Internal structures
 
+type TileEntry = anyhow::Result<(usize, usize, usize, usize, Vec<f32>)>;
+
 struct CompressedHduInfo {
     znaxis1: usize,
     znaxis2: usize,
@@ -140,19 +142,7 @@ fn find_compressed_info(path: &Path) -> anyhow::Result<CompressedHduInfo> {
 fn collect_keywords<'a>(
     iter: impl Iterator<Item = (&'a str, &'a fitsrs::card::Value)>,
 ) -> HashMap<String, String> {
-    iter.map(|(k, v)| (k.to_owned(), value_to_str(v))).collect()
-}
-
-fn value_to_str(val: &fitsrs::card::Value) -> String {
-    use fitsrs::card::Value;
-    match val {
-        Value::Integer { value: v, .. } => v.to_string(),
-        Value::Float { value: v, .. } => format!("{v:.10}"),
-        Value::Logical { value: v, .. } => if *v { "T" } else { "F" }.to_owned(),
-        Value::String { value: v, .. } => v.trim().to_owned(),
-        Value::Undefined => String::new(),
-        Value::Invalid(s) => s.clone(),
-    }
+    iter.map(|(k, v)| (k.to_owned(), crate::fits_reader::value_to_string(v))).collect()
 }
 
 fn parse_kw_usize(kw: &HashMap<String, String>, key: &str) -> anyhow::Result<usize> {
@@ -226,8 +216,8 @@ fn decompress_all_tiles(
         Vec::new()
     };
 
-    // Decompress each tile in parallel, collecting (row_idx, pixels)
-    let results: Vec<anyhow::Result<(usize, Vec<f32>)>> = (0..info.nrows)
+    // Decompress each tile in parallel, collecting (ty, tx, tw, th, pixels)
+    let results: Vec<TileEntry> = (0..info.nrows)
         .into_par_iter()
         .map(|row_idx| {
             let row = &table_bytes[row_idx * info.row_bytes..(row_idx + 1) * info.row_bytes];
@@ -240,18 +230,14 @@ fn decompress_all_tiles(
             let n_pixels = tw * th;
 
             let pixels = decompress_tile(compressed, n_pixels, info)?;
-            Ok((row_idx, pixels))
+            Ok((ty, tx, tw, th, pixels))
         })
         .collect();
 
     // Assemble into output image
     let mut image = vec![0.0f32; info.znaxis1 * info.znaxis2];
     for r in results {
-        let (row_idx, pixels) = r?;
-        let ty = row_idx / tiles_x;
-        let tx = row_idx % tiles_x;
-        let tw = info.ztile1.min(info.znaxis1.saturating_sub(tx * info.ztile1));
-        let th = info.ztile2.min(info.znaxis2.saturating_sub(ty * info.ztile2));
+        let (ty, tx, tw, th, pixels) = r?;
 
         for row in 0..th {
             let src_start = row * tw;
@@ -275,8 +261,10 @@ fn extract_compressed_bytes<'a>(
     if info.is_variable {
         // P descriptor: count (i32 BE) + heap_offset (i32 BE)
         let p = &row[col_start..col_start + 8];
-        let count = i32::from_be_bytes([p[0], p[1], p[2], p[3]]) as usize;
-        let off = i32::from_be_bytes([p[4], p[5], p[6], p[7]]) as usize;
+        let count_i = i32::from_be_bytes([p[0], p[1], p[2], p[3]]);
+        let off_i   = i32::from_be_bytes([p[4], p[5], p[6], p[7]]);
+        anyhow::ensure!(count_i >= 0 && off_i >= 0, "negative P descriptor value");
+        let (count, off) = (count_i as usize, off_i as usize);
         anyhow::ensure!(off + count <= heap.len(), "tile heap offset out of range");
         Ok(&heap[off..off + count])
     } else {

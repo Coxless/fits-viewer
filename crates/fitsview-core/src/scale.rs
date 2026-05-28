@@ -14,6 +14,15 @@ pub struct ScaleResult {
     pub vmax: f32,
 }
 
+pub fn apply_transfer(t: f32, mode: ScaleMode) -> f32 {
+    match mode {
+        ScaleMode::Linear | ScaleMode::ZScale | ScaleMode::MinMax => t,
+        ScaleMode::Log => (t * 999.0 + 1.0).log10() / 3.0,
+        ScaleMode::Sqrt => t.sqrt(),
+        ScaleMode::Asinh => (t.asinh() / std::f32::consts::PI).clamp(0.0, 1.0),
+    }
+}
+
 pub fn compute_scale(data: &[f32], mode: ScaleMode) -> ScaleResult {
     let finite: Vec<f32> = data.iter().copied().filter(|v| v.is_finite()).collect();
     if finite.is_empty() {

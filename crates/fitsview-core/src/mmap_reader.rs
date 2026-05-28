@@ -43,7 +43,7 @@ impl MmapFitsImage {
                         let data_offset = h.get_data_unit_byte_offset();
                         let mut hdr = HashMap::new();
                         for (k, v) in h.get_header().iter() {
-                            hdr.insert(k.to_owned(), value_to_string(v));
+                            hdr.insert(k.to_owned(), crate::fits_reader::value_to_string(v));
                         }
                         break (data_offset, width, height, bitpix, hdr);
                     }
@@ -129,7 +129,7 @@ impl MmapFitsImage {
                 let col = (col_start + ox * scale).min(self.width - 1);
                 let byte_pos = self.data_offset as usize + (row * self.width + col) * bpp;
                 let slice = &self.mmap[byte_pos..byte_pos + bpp];
-                decode_pixel(slice, self.bitpix, &mut out);
+                out.push(bitpix_to_f32(slice, self.bitpix));
             }
         }
 
@@ -158,9 +158,9 @@ impl MmapFitsImage {
     }
 }
 
-fn decode_pixel(slice: &[u8], bitpix: Bitpix, out: &mut Vec<f32>) {
-    let v = match bitpix {
-        Bitpix::U8 => slice[0] as f32,
+fn bitpix_to_f32(slice: &[u8], bitpix: Bitpix) -> f32 {
+    match bitpix {
+        Bitpix::U8  => slice[0] as f32,
         Bitpix::I16 => i16::from_be_bytes([slice[0], slice[1]]) as f32,
         Bitpix::I32 => i32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]) as f32,
         Bitpix::I64 => i64::from_be_bytes([
@@ -172,54 +172,14 @@ fn decode_pixel(slice: &[u8], bitpix: Bitpix, out: &mut Vec<f32>) {
             slice[0], slice[1], slice[2], slice[3],
             slice[4], slice[5], slice[6], slice[7],
         ]) as f32,
-    };
-    out.push(v);
+    }
 }
 
 fn decode_row(slice: &[u8], bitpix: Bitpix, _n: usize, out: &mut Vec<f32>) {
-    match bitpix {
-        Bitpix::U8 => {
-            out.extend(slice.iter().map(|&b| b as f32));
-        }
-        Bitpix::I16 => {
-            out.extend(slice.chunks_exact(2).map(|b| {
-                i16::from_be_bytes([b[0], b[1]]) as f32
-            }));
-        }
-        Bitpix::I32 => {
-            out.extend(slice.chunks_exact(4).map(|b| {
-                i32::from_be_bytes([b[0], b[1], b[2], b[3]]) as f32
-            }));
-        }
-        Bitpix::I64 => {
-            out.extend(slice.chunks_exact(8).map(|b| {
-                i64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f32
-            }));
-        }
-        Bitpix::F32 => {
-            out.extend(slice.chunks_exact(4).map(|b| {
-                f32::from_be_bytes([b[0], b[1], b[2], b[3]])
-            }));
-        }
-        Bitpix::F64 => {
-            out.extend(slice.chunks_exact(8).map(|b| {
-                f64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f32
-            }));
-        }
-    }
+    let bpp = bitpix.byte_size();
+    out.extend(slice.chunks_exact(bpp).map(|b| bitpix_to_f32(b, bitpix)));
 }
 
-fn value_to_string(val: &fitsrs::card::Value) -> String {
-    use fitsrs::card::Value;
-    match val {
-        Value::Integer { value: v, .. } => v.to_string(),
-        Value::Float { value: v, .. } => format!("{v:.10}"),
-        Value::Logical { value: v, .. } => if *v { "T" } else { "F" }.to_owned(),
-        Value::String { value: v, .. } => v.clone(),
-        Value::Undefined => String::new(),
-        Value::Invalid(s) => s.clone(),
-    }
-}
 
 #[cfg(test)]
 mod tests {

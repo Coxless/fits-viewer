@@ -1,4 +1,4 @@
-use fitsview_core::{colormap::{apply_colormap, Colormap}, scale::ScaleMode};
+use fitsview_core::{colormap::{apply_colormap, Colormap}, scale::{apply_transfer, ScaleMode}};
 use rayon::prelude::*;
 
 use super::Renderer;
@@ -35,11 +35,3 @@ impl Renderer for CpuRenderer {
     }
 }
 
-fn apply_transfer(t: f32, mode: ScaleMode) -> f32 {
-    match mode {
-        ScaleMode::Linear | ScaleMode::ZScale | ScaleMode::MinMax => t,
-        ScaleMode::Log => (t * 999.0 + 1.0).log10() / 3.0,
-        ScaleMode::Sqrt => t.sqrt(),
-        ScaleMode::Asinh => (t.asinh() / std::f32::consts::PI).clamp(0.0, 1.0),
-    }
-}
