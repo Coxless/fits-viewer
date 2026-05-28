@@ -89,8 +89,25 @@ impl FileExplorer {
                             .unwrap_or_default();
 
                         let is_fits = is_fits_ext(path);
+                        let size_badge = if is_fits {
+                            std::fs::metadata(path)
+                                .ok()
+                                .map(|m| {
+                                    let b = m.len();
+                                    if b >= 1 << 30 {
+                                        format!(" [{:.1}G]", b as f64 / (1u64 << 30) as f64)
+                                    } else if b >= 1 << 20 {
+                                        format!(" [{:.0}M]", b as f64 / (1u64 << 20) as f64)
+                                    } else {
+                                        String::new()
+                                    }
+                                })
+                                .unwrap_or_default()
+                        } else {
+                            String::new()
+                        };
                         let text = if is_fits {
-                            egui::RichText::new(format!("📄 {name}")).monospace()
+                            egui::RichText::new(format!("📄 {name}{size_badge}")).monospace()
                         } else {
                             egui::RichText::new(format!("  {name}")).monospace().weak()
                         };
