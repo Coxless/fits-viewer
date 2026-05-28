@@ -6,6 +6,7 @@ pub enum ScaleMode {
     Sqrt,
     Asinh,
     MinMax,
+    HistEq,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -14,13 +15,56 @@ pub struct ScaleResult {
     pub vmax: f32,
 }
 
+/// Apply the non-linear transfer function for the given scale mode.
+/// Returns a value in [0, 1] for input in [0, 1].
+/// For `HistEq`, returns `t` unchanged — the caller must apply the LUT separately.
 pub fn apply_transfer(t: f32, mode: ScaleMode) -> f32 {
     match mode {
-        ScaleMode::Linear | ScaleMode::ZScale | ScaleMode::MinMax => t,
+        ScaleMode::Linear | ScaleMode::ZScale | ScaleMode::MinMax | ScaleMode::HistEq => t,
         ScaleMode::Log => (t * 999.0 + 1.0).log10() / 3.0,
         ScaleMode::Sqrt => t.sqrt(),
         ScaleMode::Asinh => (t.asinh() / std::f32::consts::PI).clamp(0.0, 1.0),
     }
+}
+
+/// Apply DS9-compatible contrast and bias to a normalized value in [0, 1].
+///
+/// - `bias`: midpoint of the output range [0, 1], default 0.5.
+/// - `contrast`: slope multiplier around the midpoint (1.0 = no change).
+pub fn apply_contrast_bias(t: f32, contrast: f32, bias: f32) -> f32 {
+    (0.5 + (t - bias) * contrast).clamp(0.0, 1.0)
+}
+
+/// Build a 65536-entry histogram equalization LUT.
+///
+/// The LUT maps normalized intensity index → equalized normalized intensity [0, 1].
+/// Caller normalizes a pixel value to `[0, 65535]` via `((v - vmin) / range * 65535)` to index.
+pub fn build_histeq_lut(data: &[f32], vmin: f32, vmax: f32) -> Vec<f32> {
+    const BINS: usize = 65536;
+    let mut hist = vec![0u32; BINS];
+    let range = (vmax - vmin).max(f32::EPSILON);
+    let mut n_finite = 0usize;
+
+    for &v in data {
+        if v.is_finite() {
+            let idx = (((v - vmin) / range) * (BINS as f32 - 1.0)).clamp(0.0, BINS as f32 - 1.0) as usize;
+            hist[idx] += 1;
+            n_finite += 1;
+        }
+    }
+
+    // Compute CDF and normalize to [0, 1]
+    let mut lut = vec![0.0f32; BINS];
+    if n_finite == 0 {
+        return lut;
+    }
+    let mut cumsum = 0u64;
+    let n = n_finite as f64;
+    for i in 0..BINS {
+        cumsum += hist[i] as u64;
+        lut[i] = (cumsum as f64 / n) as f32;
+    }
+    lut
 }
 
 pub fn compute_scale(data: &[f32], mode: ScaleMode) -> ScaleResult {
@@ -31,7 +75,7 @@ pub fn compute_scale(data: &[f32], mode: ScaleMode) -> ScaleResult {
 
     match mode {
         ScaleMode::ZScale => zscale(&finite),
-        ScaleMode::MinMax | ScaleMode::Linear => minmax(&finite),
+        ScaleMode::MinMax | ScaleMode::Linear | ScaleMode::HistEq => minmax(&finite),
         // Log/Sqrt/Asinh use MinMax range; transfer function applied at render time
         ScaleMode::Log | ScaleMode::Sqrt | ScaleMode::Asinh => minmax(&finite),
     }
@@ -135,5 +179,32 @@ mod tests {
         let r = compute_scale(&data, ScaleMode::MinMax);
         assert_eq!(r.vmin, 0.0);
         assert_eq!(r.vmax, 1.0);
+    }
+
+    #[test]
+    fn test_contrast_bias_identity() {
+        let t = apply_contrast_bias(0.5, 1.0, 0.5);
+        assert!((t - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_contrast_bias_clamp() {
+        assert_eq!(apply_contrast_bias(0.75, 2.0, 0.5), 1.0);
+        assert_eq!(apply_contrast_bias(0.25, 2.0, 0.5), 0.0);
+    }
+
+    #[test]
+    fn test_histeq_lut_size() {
+        let data: Vec<f32> = (0..256).map(|i| i as f32).collect();
+        let lut = build_histeq_lut(&data, 0.0, 255.0);
+        assert_eq!(lut.len(), 65536);
+        assert!(lut.last().copied().unwrap_or(0.0) > 0.99);
+    }
+
+    #[test]
+    fn test_histeq_scale_mode() {
+        let data: Vec<f32> = (0..100).map(|i| i as f32).collect();
+        let r = compute_scale(&data, ScaleMode::HistEq);
+        assert!(r.vmin < r.vmax);
     }
 }

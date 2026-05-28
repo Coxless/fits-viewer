@@ -6,9 +6,12 @@ use egui::TextureHandle;
 use fitsview_core::{
     colormap::Colormap,
     event_image::EventImage,
-    fits_reader::FitsImage,
+    fits_reader::{FitsImage, HduInfo},
     mmap_reader::MmapFitsImage,
+    region::RegionFile,
     scale::{ScaleMode, ScaleResult},
+    stats::ImageStats,
+    wcs::Wcs,
 };
 
 use crate::viewport::ViewState;
@@ -89,11 +92,29 @@ pub struct Tab {
     pub texture: Option<TextureHandle>,
     pub needs_retexture: bool,
     pub needs_fit: bool,
+    pub needs_hdu_reload: bool,
     pub error: Option<String>,
     /// Per-tile textures for LargeImage rendering: key = (zoom_level, tx, ty)
     pub tile_textures: HashMap<(u8, usize, usize), TextureHandle>,
-    /// LOD level in use when tile_textures was last populated; changes trigger a cache clear.
+    /// LOD level in use when tile_textures was last populated
     pub last_lod: u8,
+    /// All HDUs in the file
+    pub hdu_list: Vec<HduInfo>,
+    /// Parsed WCS from header
+    pub wcs: Option<Wcs>,
+    /// Cached image statistics
+    pub stats: Option<Arc<ImageStats>>,
+    pub stats_computing: bool,
+    /// DS9-style contrast (1.0 = default)
+    pub contrast: f32,
+    /// DS9-style bias midpoint (0.5 = default)
+    pub bias: f32,
+    /// HistEq LUT (built on demand when ScaleMode::HistEq is active)
+    pub histeq_lut: Option<Arc<Vec<f32>>>,
+    /// Loaded DS9 region files
+    pub region_files: Vec<RegionFile>,
+    /// Show crosshair cursor
+    pub crosshair: bool,
 }
 
 impl Tab {
@@ -110,9 +131,19 @@ impl Tab {
             texture: None,
             needs_retexture: true,
             needs_fit: true,
+            needs_hdu_reload: false,
             error: None,
             tile_textures: HashMap::new(),
             last_lod: 0,
+            hdu_list: Vec::new(),
+            wcs: None,
+            stats: None,
+            stats_computing: false,
+            contrast: 1.0,
+            bias: 0.5,
+            histeq_lut: None,
+            region_files: Vec::new(),
+            crosshair: false,
         }
     }
 
@@ -153,11 +184,16 @@ impl TabManager {
     }
 
     /// Replace a Loading tab's data once the background load completes.
-    pub fn finish_loading(&mut self, tab_id: u64, data: FileData) {
+    pub fn finish_loading(&mut self, tab_id: u64, data: FileData, hdu_list: Vec<HduInfo>, wcs: Option<Wcs>) {
         if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
             tab.data = data;
+            tab.hdu_list = hdu_list;
+            tab.wcs = wcs;
             tab.needs_fit = true;
             tab.needs_retexture = true;
+            tab.histeq_lut = None;
+            tab.stats = None;
+            tab.stats_computing = false;
         }
     }
 

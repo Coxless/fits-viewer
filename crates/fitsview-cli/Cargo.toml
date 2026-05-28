@@ -20,3 +20,5 @@ clap = { version = "4", features = ["derive"] }
 anyhow = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+serde_json = { workspace = true }
