@@ -926,6 +926,7 @@ dependencies = [
  "anyhow",
  "env_logger",
  "fitsrs",
+ "flate2",
  "log",
  "lru",
  "memmap2",

@@ -90,8 +90,10 @@ pub struct Tab {
     pub needs_retexture: bool,
     pub needs_fit: bool,
     pub error: Option<String>,
-    /// Per-tile textures for LargeImage rendering: key = (tx, ty)
-    pub tile_textures: HashMap<(usize, usize), TextureHandle>,
+    /// Per-tile textures for LargeImage rendering: key = (zoom_level, tx, ty)
+    pub tile_textures: HashMap<(u8, usize, usize), TextureHandle>,
+    /// LOD level in use when tile_textures was last populated; changes trigger a cache clear.
+    pub last_lod: u8,
 }
 
 impl Tab {
@@ -110,6 +112,7 @@ impl Tab {
             needs_fit: true,
             error: None,
             tile_textures: HashMap::new(),
+            last_lod: 0,
         }
     }
 

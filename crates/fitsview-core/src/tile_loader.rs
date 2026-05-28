@@ -34,14 +34,14 @@ impl TileLoader {
                 let tx = result_tx.clone();
                 let key = req.key.clone();
                 let source = req.source.clone();
-                let tile_size = key.tile_size;
                 let tx2 = key.tx;
                 let ty2 = key.ty;
                 tokio::task::spawn_blocking(move || {
+                    let zoom_level = key.zoom_level;
                     let result = source
-                        .read_tile(tx2, ty2, tile_size)
+                        .read_tile_lod(tx2, ty2, zoom_level)
                         .map(|pixels| {
-                            let (w, h) = source.tile_dims(tx2, ty2, tile_size);
+                            let (w, h) = source.tile_dims_lod(tx2, ty2, zoom_level);
                             TileData { pixels, width: w, height: h }
                         })
                         .map_err(|e| e.to_string());

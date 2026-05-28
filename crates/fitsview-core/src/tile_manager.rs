@@ -7,7 +7,8 @@ use lru::LruCache;
 pub struct TileKey {
     pub file_id: u64,
     pub hdu: usize,
-    pub tile_size: usize,
+    /// 0 = full resolution, k = 2^k downsampled
+    pub zoom_level: u8,
     pub tx: usize,
     pub ty: usize,
 }
@@ -90,7 +91,7 @@ mod tests {
     }
 
     fn key(file_id: u64, tx: usize, ty: usize) -> TileKey {
-        TileKey { file_id, hdu: 0, tile_size: 512, tx, ty }
+        TileKey { file_id, hdu: 0, zoom_level: 0, tx, ty }
     }
 
     #[test]

@@ -26,6 +26,12 @@ use crate::{
 /// Files larger than this are opened via the tile-based LargeImage path.
 const LARGE_FILE_THRESHOLD: u64 = 512 * 1024 * 1024;
 
+/// Map a viewport zoom factor to a discrete LOD level (0 = full resolution).
+/// At level k, one output pixel represents 2^k image pixels.
+fn zoom_to_lod(zoom: f32) -> u8 {
+    if zoom >= 1.0 { 0 } else { ((1.0_f32 / zoom).log2().ceil() as u8).min(6) }
+}
+
 pub struct FitsViewApp {
     tabs: TabManager,
     file_explorer: FileExplorer,
@@ -411,7 +417,7 @@ impl FitsViewApp {
         do_fit: bool,
         tile_manager: &mut TileManager,
         renderer: &dyn Renderer,
-        missing: &mut Vec<(u64, usize, usize)>, // (file_id, tx, ty)
+        missing: &mut Vec<(u64, u8, usize, usize)>, // (file_id, lod, tx, ty)
     ) -> Option<egui::Pos2> {
         let available = ui.available_rect_before_wrap();
         let w = tab.data.width();
@@ -449,19 +455,31 @@ impl FitsViewApp {
         let zoom = tab.view.zoom;
         let offset = tab.view.offset;
 
+        // LOD level: at level k, each output tile covers (TILE_SIZE * 2^k)^2 image pixels.
+        let lod = zoom_to_lod(zoom);
+        let scale = 1usize << lod;
+        let effective_tile = ts * scale;
+
+        // Clear texture cache when LOD changes to avoid stale textures.
+        if lod != tab.last_lod {
+            tab.tile_textures.clear();
+            tab.scale_result = None;
+            tab.last_lod = lod;
+        }
+
         // Visible image coordinate range
         let vis_x0 = -offset.x;
         let vis_x1 = available.width() / zoom - offset.x;
         let vis_y0 = -offset.y;
         let vis_y1 = available.height() / zoom - offset.y;
 
-        let tiles_x = w.div_ceil(ts);
-        let tiles_y = h.div_ceil(ts);
+        let tiles_x = w.div_ceil(effective_tile);
+        let tiles_y = h.div_ceil(effective_tile);
 
-        let tx_min = ((vis_x0 / ts as f32).floor() as isize).max(0) as usize;
-        let tx_max = ((vis_x1 / ts as f32).ceil() as isize).min(tiles_x as isize) as usize;
-        let ty_min = ((vis_y0 / ts as f32).floor() as isize).max(0) as usize;
-        let ty_max = ((vis_y1 / ts as f32).ceil() as isize).min(tiles_y as isize) as usize;
+        let tx_min = ((vis_x0 / effective_tile as f32).floor() as isize).max(0) as usize;
+        let tx_max = ((vis_x1 / effective_tile as f32).ceil() as isize).min(tiles_x as isize) as usize;
+        let ty_min = ((vis_y0 / effective_tile as f32).floor() as isize).max(0) as usize;
+        let ty_max = ((vis_y1 / effective_tile as f32).ceil() as isize).min(tiles_y as isize) as usize;
 
         let file_id = if let FileData::LargeImage(ref lis) = tab.data {
             lis.file_id
@@ -476,13 +494,13 @@ impl FitsViewApp {
 
         for ty in ty_min..ty_max {
             for tx in tx_min..tx_max {
-                let key = TileKey { file_id, hdu: 0, tile_size: ts, tx, ty };
+                let key = TileKey { file_id, hdu: 0, zoom_level: lod, tx, ty };
 
-                // Tile screen rect
-                let tile_img_x = (tx * ts) as f32;
-                let tile_img_y = (ty * ts) as f32;
-                let tile_w = (ts).min(w - tx * ts) as f32;
-                let tile_h = (ts).min(h - ty * ts) as f32;
+                // Tile screen rect — one LOD tile covers `effective_tile` image pixels.
+                let tile_img_x = (tx * effective_tile) as f32;
+                let tile_img_y = (ty * effective_tile) as f32;
+                let tile_img_w = (effective_tile).min(w - tx * effective_tile) as f32;
+                let tile_img_h = (effective_tile).min(h - ty * effective_tile) as f32;
                 let screen_origin = available.min.to_vec2()
                     + egui::vec2(
                         (tile_img_x + offset.x) * zoom,
@@ -490,7 +508,7 @@ impl FitsViewApp {
                     );
                 let screen_rect = Rect::from_min_size(
                     screen_origin.to_pos2(),
-                    egui::vec2(tile_w * zoom, tile_h * zoom),
+                    egui::vec2(tile_img_w * zoom, tile_img_h * zoom),
                 );
 
                 if let Some(tile_arc) = tile_manager.get(&key) {
@@ -503,7 +521,7 @@ impl FitsViewApp {
                     let vmin_use = tab.scale_result.map(|s| s.vmin).unwrap_or(vmin);
                     let vmax_use = tab.scale_result.map(|s| s.vmax).unwrap_or(vmax);
 
-                    let texture = tab.tile_textures.entry((tx, ty)).or_insert_with(|| {
+                    let texture = tab.tile_textures.entry((lod, tx, ty)).or_insert_with(|| {
                         let rgba = renderer.render(
                             &tile_arc.pixels,
                             tile_arc.width,
@@ -518,7 +536,7 @@ impl FitsViewApp {
                             &rgba,
                         );
                         ctx.load_texture(
-                            format!("tile-{file_id}-{tx}-{ty}"),
+                            format!("tile-{file_id}-{lod}-{tx}-{ty}"),
                             ci,
                             TextureOptions::LINEAR,
                         )
@@ -534,7 +552,7 @@ impl FitsViewApp {
                         0.0,
                         Color32::from_rgb(60, 60, 60),
                     );
-                    missing.push((file_id, tx, ty));
+                    missing.push((file_id, lod, tx, ty));
                 }
             }
         }
@@ -648,7 +666,7 @@ impl eframe::App for FitsViewApp {
         self.tabs.show_tab_bar(ctx);
 
         // Collect tile requests during render; submit after borrow is released.
-        let mut missing_tiles: Vec<(u64, usize, usize)> = Vec::new();
+        let mut missing_tiles: Vec<(u64, u8, usize, usize)> = Vec::new();
         let mut new_cursor_pos = None;
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -838,7 +856,7 @@ impl eframe::App for FitsViewApp {
         self.cursor_image_pos = new_cursor_pos;
 
         // Submit tile requests after render
-        for (file_id, tx, ty) in missing_tiles {
+        for (file_id, lod, tx, ty) in missing_tiles {
             let source = self.tabs.tabs.iter().find_map(|t| {
                 if let FileData::LargeImage(ref lis) = t.data {
                     if lis.file_id == file_id {
@@ -849,13 +867,7 @@ impl eframe::App for FitsViewApp {
             });
             if let Some(src) = source {
                 self.tile_loader.request(TileRequest {
-                    key: TileKey {
-                        file_id,
-                        hdu: 0,
-                        tile_size: TileManager::TILE_SIZE,
-                        tx,
-                        ty,
-                    },
+                    key: TileKey { file_id, hdu: 0, zoom_level: lod, tx, ty },
                     source: src,
                 });
             }
