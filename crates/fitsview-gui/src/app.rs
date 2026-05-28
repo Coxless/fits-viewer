@@ -1,22 +1,30 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use egui::{vec2, Color32, ColorImage, Rect, TextureHandle, TextureOptions, ViewportCommand};
 use fitsview_core::{
     colormap::render_to_rgba,
     event_image::bin_events,
     fits_reader::load_fits,
+    mmap_reader::MmapFitsImage,
     scale::compute_scale,
+    tile_loader::{TileLoader, TileRequest},
+    tile_manager::{TileKey, TileManager},
 };
 
 use crate::{
     command_palette::{Command, CommandPalette},
     file_explorer::FileExplorer,
     header_panel::HeaderPanel,
+    renderer::{create_renderer, Renderer},
     split_view::{SplitLayout, SplitView},
     status_bar::StatusBar,
-    tab_manager::{FileData, Tab, TabManager},
+    tab_manager::{FileData, LargeImageState, Tab, TabManager},
     viewport::ViewState,
 };
+
+/// Files larger than this are opened via the tile-based LargeImage path.
+const LARGE_FILE_THRESHOLD: u64 = 512 * 1024 * 1024;
 
 pub struct FitsViewApp {
     tabs: TabManager,
@@ -24,22 +32,33 @@ pub struct FitsViewApp {
     header_panel: HeaderPanel,
     split_view: SplitView,
     command_palette: CommandPalette,
-    /// Pending path input for "Open File" via command palette
     open_path_input: Option<String>,
-    /// Pending path input for "Open Directory" via command palette
     open_dir_input: Option<String>,
-    /// Chord state: was Ctrl+K pressed last frame?
     last_key_ctrl_k: bool,
-    /// Image-space cursor position for status bar (updated each frame)
     cursor_image_pos: Option<egui::Pos2>,
+    // Large-file tile infrastructure
+    tile_manager: TileManager,
+    tile_loader: TileLoader,
+    tokio_rt: Arc<tokio::runtime::Runtime>,
+    renderer: Box<dyn Renderer>,
 }
 
 impl FitsViewApp {
     pub fn new(
-        _cc: &eframe::CreationContext<'_>,
+        cc: &eframe::CreationContext<'_>,
         initial_paths: Vec<PathBuf>,
         initial_dir: Option<PathBuf>,
     ) -> Self {
+        let tokio_rt = Arc::new(tokio::runtime::Runtime::new().expect("tokio runtime"));
+        let tile_loader = TileLoader::new(&tokio_rt);
+        let tile_manager = TileManager::new(TileManager::MAX_MEMORY);
+
+        #[cfg(feature = "wgpu")]
+        let renderer = create_renderer(cc.wgpu_render_state.as_ref());
+        #[cfg(not(feature = "wgpu"))]
+        let renderer = create_renderer();
+        let _ = cc; // suppress unused warning when wgpu feature is off
+
         let mut app = Self {
             tabs: TabManager::default(),
             file_explorer: FileExplorer::default(),
@@ -50,14 +69,16 @@ impl FitsViewApp {
             open_dir_input: None,
             last_key_ctrl_k: false,
             cursor_image_pos: None,
+            tile_manager,
+            tile_loader,
+            tokio_rt,
+            renderer,
         };
 
-        // Open initial directory in explorer
         if let Some(dir) = initial_dir {
             app.file_explorer.set_root(dir);
         }
 
-        // Open initial files as tabs
         for path in initial_paths {
             app.open_file(&path);
         }
@@ -65,15 +86,15 @@ impl FitsViewApp {
         app
     }
 
-    /// Load a FITS file (image or event list) and open it as a new tab.
     fn open_file(&mut self, path: &Path) {
         match load_file(path) {
-            Ok(data) => {
-                let tab_id = {
-                    self.tabs.open(path.to_path_buf(), data);
-                    // get the new tab's id
-                    self.tabs.active_id.unwrap()
-                };
+            Ok(mut data) => {
+                // For large images, assign a file_id from the tile manager
+                if let FileData::LargeImage(ref mut lis) = data {
+                    lis.file_id = self.tile_manager.register_file();
+                }
+                self.tabs.open(path.to_path_buf(), data);
+                let tab_id = self.tabs.active_id.unwrap();
                 self.split_view.assign_active(tab_id);
             }
             Err(e) => {
@@ -86,50 +107,41 @@ impl FitsViewApp {
         let mut do_fit = false;
 
         ctx.input_mut(|i| {
-            // Ctrl+H — toggle header panel
             if i.consume_key(egui::Modifiers::CTRL, egui::Key::H) {
                 self.header_panel.visible = !self.header_panel.visible;
             }
-            // Ctrl+B — toggle file explorer
             if i.consume_key(egui::Modifiers::CTRL, egui::Key::B) {
                 self.file_explorer.visible = !self.file_explorer.visible;
             }
-            // Ctrl+Shift+P — command palette
             if i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::P) {
                 self.command_palette.open();
             }
-            // Ctrl+0 — fit to window
             if i.consume_key(egui::Modifiers::CTRL, egui::Key::Num0) {
                 do_fit = true;
             }
-            // Ctrl++ / Ctrl+= — zoom in
             if i.consume_key(egui::Modifiers::CTRL, egui::Key::Plus)
                 || i.consume_key(egui::Modifiers::CTRL, egui::Key::Equals)
             {
                 if let Some(tab) = self.tabs.active_tab_mut() {
-                    tab.view.zoom =
-                        (tab.view.zoom * ViewState::ZOOM_STEP).clamp(ViewState::ZOOM_MIN, ViewState::ZOOM_MAX);
+                    tab.view.zoom = (tab.view.zoom * ViewState::ZOOM_STEP)
+                        .clamp(ViewState::ZOOM_MIN, ViewState::ZOOM_MAX);
                 }
             }
-            // Ctrl+- — zoom out
             if i.consume_key(egui::Modifiers::CTRL, egui::Key::Minus) {
                 if let Some(tab) = self.tabs.active_tab_mut() {
-                    tab.view.zoom =
-                        (tab.view.zoom / ViewState::ZOOM_STEP).clamp(ViewState::ZOOM_MIN, ViewState::ZOOM_MAX);
+                    tab.view.zoom = (tab.view.zoom / ViewState::ZOOM_STEP)
+                        .clamp(ViewState::ZOOM_MIN, ViewState::ZOOM_MAX);
                 }
             }
-            // Ctrl+W — close tab
             if i.consume_key(egui::Modifiers::CTRL, egui::Key::W) {
                 if let Some(id) = self.tabs.active_id {
                     self.split_view.remove_tab(id);
                 }
                 self.tabs.close_active();
-                // Assign next active tab to split view
                 if let Some(id) = self.tabs.active_id {
                     self.split_view.fill_empty(id);
                 }
             }
-            // Ctrl+Tab / Ctrl+Shift+Tab
             if i.consume_key(egui::Modifiers::CTRL, egui::Key::Tab) {
                 self.tabs.next_tab();
                 if let Some(id) = self.tabs.active_id {
@@ -143,23 +155,19 @@ impl FitsViewApp {
                 }
             }
 
-            // Ctrl+\ — vertical split
             let ctrl_backslash = i.consume_key(egui::Modifiers::CTRL, egui::Key::Backslash);
             if ctrl_backslash && !self.last_key_ctrl_k {
                 self.split_view.set_layout(SplitLayout::SideBySide);
             }
-            // Ctrl+K chord tracking
             if i.consume_key(egui::Modifiers::CTRL, egui::Key::K) {
                 self.last_key_ctrl_k = true;
             } else if self.last_key_ctrl_k {
-                // Ctrl+K Ctrl+\ — horizontal split
                 if ctrl_backslash {
                     self.split_view.set_layout(SplitLayout::Grid2x2);
                 }
                 self.last_key_ctrl_k = false;
             }
 
-            // [ / ] — HDU navigation
             if i.consume_key(egui::Modifiers::NONE, egui::Key::OpenBracket) {
                 if let Some(tab) = self.tabs.active_tab_mut() {
                     if tab.hdu_index > 0 {
@@ -181,16 +189,13 @@ impl FitsViewApp {
 
     fn apply_command(&mut self, cmd: Command) {
         match cmd {
-            Command::OpenFile => {
-                self.open_path_input = Some(String::new());
-            }
-            Command::OpenDirectory => {
-                self.open_dir_input = Some(String::new());
-            }
+            Command::OpenFile => self.open_path_input = Some(String::new()),
+            Command::OpenDirectory => self.open_dir_input = Some(String::new()),
             Command::SetColormap(cmap) => {
                 if let Some(tab) = self.tabs.active_tab_mut() {
                     tab.colormap = cmap;
                     tab.needs_retexture = true;
+                    tab.tile_textures.clear();
                 }
             }
             Command::SetScale(mode) => {
@@ -198,20 +203,15 @@ impl FitsViewApp {
                     tab.scale_mode = mode;
                     tab.scale_result = None;
                     tab.needs_retexture = true;
+                    tab.tile_textures.clear();
                 }
             }
-            Command::ToggleSidebar => {
-                self.file_explorer.visible = !self.file_explorer.visible;
-            }
+            Command::ToggleSidebar => self.file_explorer.visible = !self.file_explorer.visible,
             Command::ToggleHeaderPanel => {
-                self.header_panel.visible = !self.header_panel.visible;
+                self.header_panel.visible = !self.header_panel.visible
             }
-            Command::SplitVertical => {
-                self.split_view.set_layout(SplitLayout::SideBySide);
-            }
-            Command::SplitHorizontal => {
-                self.split_view.set_layout(SplitLayout::Grid2x2);
-            }
+            Command::SplitVertical => self.split_view.set_layout(SplitLayout::SideBySide),
+            Command::SplitHorizontal => self.split_view.set_layout(SplitLayout::Grid2x2),
             Command::FitToWindow => {
                 if let Some(tab) = self.tabs.active_tab_mut() {
                     tab.needs_fit = true;
@@ -221,7 +221,6 @@ impl FitsViewApp {
     }
 
     fn show_path_input_dialogs(&mut self, ctx: &egui::Context) {
-        // Simple path-input overlay for "Open File"
         let mut file_to_open: Option<PathBuf> = None;
         if let Some(ref mut input) = self.open_path_input.clone() {
             let mut close = false;
@@ -254,7 +253,6 @@ impl FitsViewApp {
             self.open_file(&p);
         }
 
-        // Simple path-input overlay for "Open Directory"
         let mut dir_to_open: Option<PathBuf> = None;
         if let Some(ref mut input) = self.open_dir_input.clone() {
             let mut close = false;
@@ -291,6 +289,8 @@ impl FitsViewApp {
         }
     }
 
+    // --- Small-image rendering (existing path) ---
+
     fn render_pane(
         tab: &mut Tab,
         ui: &mut egui::Ui,
@@ -299,13 +299,11 @@ impl FitsViewApp {
     ) -> Option<egui::Pos2> {
         let available = ui.available_rect_before_wrap();
 
-        // Build or rebuild texture
         if tab.texture.is_none() || tab.needs_retexture {
             tab.texture = Some(build_texture(ctx, tab));
             tab.needs_retexture = false;
         }
 
-        // Initial fit
         if tab.needs_fit || do_fit {
             tab.needs_fit = false;
             let img_size = vec2(tab.data.width() as f32, tab.data.height() as f32);
@@ -314,7 +312,6 @@ impl FitsViewApp {
 
         let response = ui.allocate_rect(available, egui::Sense::drag());
 
-        // Mouse wheel zoom
         let scroll_delta = ctx.input(|i| i.smooth_scroll_delta.y);
         if response.hovered() && scroll_delta.abs() > 0.1 {
             let factor = (scroll_delta / 50.0).exp();
@@ -325,29 +322,27 @@ impl FitsViewApp {
             tab.view.zoom_toward(factor, cursor_rel);
         }
 
-        // Mouse drag pan
         if response.dragged() {
             tab.view.pan(response.drag_delta());
         }
 
-        // Compute cursor image position for status bar
-        let cursor_image_pos = ctx.input(|i| i.pointer.hover_pos()).and_then(|screen_pos| {
-            if !response.hovered() {
-                return None;
-            }
-            let panel_pos = screen_pos - available.min;
-            let img_x = panel_pos.x / tab.view.zoom - tab.view.offset.x;
-            let img_y = panel_pos.y / tab.view.zoom - tab.view.offset.y;
-            let w = tab.data.width() as f32;
-            let h = tab.data.height() as f32;
-            if img_x >= 0.0 && img_y >= 0.0 && img_x < w && img_y < h {
-                Some(egui::pos2(img_x, img_y))
-            } else {
-                None
-            }
-        });
+        let cursor_image_pos =
+            ctx.input(|i| i.pointer.hover_pos()).and_then(|screen_pos| {
+                if !response.hovered() {
+                    return None;
+                }
+                let panel_pos = screen_pos - available.min;
+                let img_x = panel_pos.x / tab.view.zoom - tab.view.offset.x;
+                let img_y = panel_pos.y / tab.view.zoom - tab.view.offset.y;
+                let w = tab.data.width() as f32;
+                let h = tab.data.height() as f32;
+                if img_x >= 0.0 && img_y >= 0.0 && img_x < w && img_y < h {
+                    Some(egui::pos2(img_x, img_y))
+                } else {
+                    None
+                }
+            });
 
-        // Draw image
         if let Some(ref texture) = &tab.texture.clone() {
             let img_size = vec2(tab.data.width() as f32, tab.data.height() as f32);
             let display_size = img_size * tab.view.zoom;
@@ -358,6 +353,159 @@ impl FitsViewApp {
         }
 
         cursor_image_pos
+    }
+
+    // --- Large-image tile rendering ---
+
+    fn render_large_pane(
+        tab: &mut Tab,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        do_fit: bool,
+        tile_manager: &mut TileManager,
+        renderer: &dyn Renderer,
+        missing: &mut Vec<(u64, usize, usize)>, // (file_id, tx, ty)
+    ) -> Option<egui::Pos2> {
+        let available = ui.available_rect_before_wrap();
+        let w = tab.data.width();
+        let h = tab.data.height();
+        let ts = TileManager::TILE_SIZE;
+
+        // Invalidate tile textures when retexture is needed
+        if tab.needs_retexture {
+            tab.tile_textures.clear();
+            tab.scale_result = None;
+            tab.needs_retexture = false;
+        }
+
+        if tab.needs_fit || do_fit {
+            tab.needs_fit = false;
+            tab.view.fit_to_rect(available, vec2(w as f32, h as f32));
+        }
+
+        let response = ui.allocate_rect(available, egui::Sense::drag());
+
+        let scroll_delta = ctx.input(|i| i.smooth_scroll_delta.y);
+        if response.hovered() && scroll_delta.abs() > 0.1 {
+            let factor = (scroll_delta / 50.0).exp();
+            let cursor_pos = ctx
+                .input(|i| i.pointer.hover_pos())
+                .unwrap_or(available.center());
+            let cursor_rel = cursor_pos.to_vec2() - available.min.to_vec2();
+            tab.view.zoom_toward(factor, cursor_rel);
+        }
+
+        if response.dragged() {
+            tab.view.pan(response.drag_delta());
+        }
+
+        let zoom = tab.view.zoom;
+        let offset = tab.view.offset;
+
+        // Visible image coordinate range
+        let vis_x0 = -offset.x;
+        let vis_x1 = available.width() / zoom - offset.x;
+        let vis_y0 = -offset.y;
+        let vis_y1 = available.height() / zoom - offset.y;
+
+        let tiles_x = w.div_ceil(ts);
+        let tiles_y = h.div_ceil(ts);
+
+        let tx_min = ((vis_x0 / ts as f32).floor() as isize).max(0) as usize;
+        let tx_max = ((vis_x1 / ts as f32).ceil() as isize).min(tiles_x as isize) as usize;
+        let ty_min = ((vis_y0 / ts as f32).floor() as isize).max(0) as usize;
+        let ty_max = ((vis_y1 / ts as f32).ceil() as isize).min(tiles_y as isize) as usize;
+
+        let file_id = if let FileData::LargeImage(ref lis) = tab.data {
+            lis.file_id
+        } else {
+            return None;
+        };
+
+        let vmin = tab.scale_result.map(|s| s.vmin).unwrap_or(0.0);
+        let vmax = tab.scale_result.map(|s| s.vmax).unwrap_or(1.0);
+        let colormap = tab.colormap;
+        let scale_mode = tab.scale_mode;
+
+        for ty in ty_min..ty_max {
+            for tx in tx_min..tx_max {
+                let key = TileKey { file_id, hdu: 0, tile_size: ts, tx, ty };
+
+                // Tile screen rect
+                let tile_img_x = (tx * ts) as f32;
+                let tile_img_y = (ty * ts) as f32;
+                let tile_w = (ts).min(w - tx * ts) as f32;
+                let tile_h = (ts).min(h - ty * ts) as f32;
+                let screen_origin = available.min.to_vec2()
+                    + egui::vec2(
+                        (tile_img_x + offset.x) * zoom,
+                        (tile_img_y + offset.y) * zoom,
+                    );
+                let screen_rect = Rect::from_min_size(
+                    screen_origin.to_pos2(),
+                    egui::vec2(tile_w * zoom, tile_h * zoom),
+                );
+
+                if let Some(tile_arc) = tile_manager.get(&key) {
+                    // Update scale_result from first available tile
+                    if tab.scale_result.is_none() {
+                        tab.scale_result =
+                            Some(compute_scale(&tile_arc.pixels, scale_mode));
+                    }
+
+                    let vmin_use = tab.scale_result.map(|s| s.vmin).unwrap_or(vmin);
+                    let vmax_use = tab.scale_result.map(|s| s.vmax).unwrap_or(vmax);
+
+                    let texture = tab.tile_textures.entry((tx, ty)).or_insert_with(|| {
+                        let rgba = renderer.render(
+                            &tile_arc.pixels,
+                            tile_arc.width,
+                            tile_arc.height,
+                            vmin_use,
+                            vmax_use,
+                            scale_mode,
+                            colormap,
+                        );
+                        let ci = ColorImage::from_rgba_unmultiplied(
+                            [tile_arc.width, tile_arc.height],
+                            &rgba,
+                        );
+                        ctx.load_texture(
+                            format!("tile-{file_id}-{tx}-{ty}"),
+                            ci,
+                            TextureOptions::LINEAR,
+                        )
+                    });
+
+                    let uv =
+                        Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                    ui.painter().image(texture.id(), screen_rect, uv, Color32::WHITE);
+                } else {
+                    // Gray placeholder while tile loads
+                    ui.painter().rect_filled(
+                        screen_rect,
+                        0.0,
+                        Color32::from_rgb(60, 60, 60),
+                    );
+                    missing.push((file_id, tx, ty));
+                }
+            }
+        }
+
+        // Cursor position
+        ctx.input(|i| i.pointer.hover_pos()).and_then(|screen_pos| {
+            if !response.hovered() {
+                return None;
+            }
+            let panel_pos = screen_pos - available.min;
+            let img_x = panel_pos.x / zoom - offset.x;
+            let img_y = panel_pos.y / zoom - offset.y;
+            if img_x >= 0.0 && img_y >= 0.0 && img_x < w as f32 && img_y < h as f32 {
+                Some(egui::pos2(img_x, img_y))
+            } else {
+                None
+            }
+        })
     }
 }
 
@@ -376,7 +524,7 @@ fn build_texture(ctx: &egui::Context, tab: &mut Tab) -> TextureHandle {
 
 impl eframe::App for FitsViewApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Update window title
+        // Window title
         let title = self
             .tabs
             .active_tab()
@@ -384,54 +532,88 @@ impl eframe::App for FitsViewApp {
             .unwrap_or_else(|| "fits-view".to_owned());
         ctx.send_viewport_cmd(ViewportCommand::Title(title));
 
-        // Poll filesystem events
-        let fs_changes = self.file_explorer.poll_events();
-        for _ in fs_changes {
-            // Explorer already updated its internal list; just repaint
+        // Drain completed tile loads
+        {
+            let completed = self.tile_loader.poll_completed();
+            let mut any = false;
+            for r in completed {
+                if let Ok(tile) = r.result {
+                    self.tile_manager.insert(r.key, tile);
+                    any = true;
+                }
+            }
+            if any {
+                ctx.request_repaint();
+            }
         }
 
-        // Handle keyboard shortcuts
+        // Filesystem events
+        let _fs_changes = self.file_explorer.poll_events();
+
         let do_fit = self.handle_keys(ctx);
 
-        // Show command palette
         if let Some(cmd) = self.command_palette.show(ctx) {
             self.apply_command(cmd);
         }
 
-        // Show file-open dialogs
         self.show_path_input_dialogs(ctx);
 
-        // File explorer (left panel)
         if let Some(path) = self.file_explorer.show(ctx) {
             self.open_file(&path);
         }
 
-        // Header panel (right panel) — based on active tab
         if let Some(tab) = self.tabs.active_tab() {
             self.header_panel.show(ctx, tab.data.header());
         }
 
-        // Status bar (bottom panel)
-        StatusBar::show(ctx, self.tabs.active_tab(), self.cursor_image_pos);
+        // Tile status for status bar
+        let tile_status = if self
+            .tabs
+            .active_tab()
+            .map(|t| t.data.is_large())
+            .unwrap_or(false)
+        {
+            let pending = self.tile_loader.pending;
+            let cache_mb = self.tile_manager.memory_used() / (1024 * 1024);
+            Some((pending, cache_mb))
+        } else {
+            None
+        };
 
-        // Tab bar (top panel, below any menu bar)
+        StatusBar::show(ctx, self.tabs.active_tab(), self.cursor_image_pos, tile_status);
         self.tabs.show_tab_bar(ctx);
 
-        // Central panel — split view rendering
+        // Collect tile requests during render; submit after borrow is released.
+        let mut missing_tiles: Vec<(u64, usize, usize)> = Vec::new();
+        let mut new_cursor_pos = None;
+
         egui::CentralPanel::default().show(ctx, |ui| {
             let available = ui.available_rect_before_wrap();
-            let mut new_cursor_pos = None;
 
             match self.split_view.layout {
-                crate::split_view::SplitLayout::Single => {
+                SplitLayout::Single => {
                     let pane_tab_id = self.split_view.pane_tab_ids.first().copied().flatten();
-                    let active_id = self.tabs.active_id;
-                    let tab_id = pane_tab_id.or(active_id);
+                    let tab_id = pane_tab_id.or(self.tabs.active_id);
 
                     if let Some(id) = tab_id {
-                        if let Some(tab) = self.tabs.tabs.iter_mut().find(|t| t.id == id) {
-                            new_cursor_pos =
-                                FitsViewApp::render_pane(tab, ui, ctx, do_fit);
+                        if let Some(idx) =
+                            self.tabs.tabs.iter().position(|t| t.id == id)
+                        {
+                            let tab = &mut self.tabs.tabs[idx];
+                            if tab.data.is_large() {
+                                new_cursor_pos = FitsViewApp::render_large_pane(
+                                    tab,
+                                    ui,
+                                    ctx,
+                                    do_fit,
+                                    &mut self.tile_manager,
+                                    self.renderer.as_ref(),
+                                    &mut missing_tiles,
+                                );
+                            } else {
+                                new_cursor_pos =
+                                    FitsViewApp::render_pane(tab, ui, ctx, do_fit);
+                            }
                         }
                     } else {
                         ui.centered_and_justified(|ui| {
@@ -439,33 +621,54 @@ impl eframe::App for FitsViewApp {
                         });
                     }
                 }
-                crate::split_view::SplitLayout::SideBySide => {
+                SplitLayout::SideBySide => {
                     let half_w = available.width() / 2.0;
-                    let left_rect =
-                        Rect::from_min_size(available.min, vec2(half_w - 1.0, available.height()));
+                    let left_rect = Rect::from_min_size(
+                        available.min,
+                        vec2(half_w - 1.0, available.height()),
+                    );
                     let right_rect = Rect::from_min_size(
                         available.min + vec2(half_w + 1.0, 0.0),
                         vec2(half_w - 1.0, available.height()),
                     );
 
-                    // Draw divider
                     ui.painter().line_segment(
                         [
                             available.min + vec2(half_w, 0.0),
                             available.min + vec2(half_w, available.height()),
                         ],
-                        egui::Stroke::new(2.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+                        egui::Stroke::new(
+                            2.0,
+                            ui.visuals().widgets.noninteractive.bg_stroke.color,
+                        ),
                     );
 
-                    let pane_ids: Vec<Option<u64>> = self.split_view.pane_tab_ids.clone();
+                    let pane_ids: Vec<Option<u64>> =
+                        self.split_view.pane_tab_ids.clone();
 
                     for (pane_idx, (rect, tab_id)) in
                         [left_rect, right_rect].iter().zip(pane_ids.iter()).enumerate()
                     {
-                        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(*rect));
+                        let mut child =
+                            ui.new_child(egui::UiBuilder::new().max_rect(*rect));
                         if let Some(id) = tab_id {
-                            if let Some(tab) = self.tabs.tabs.iter_mut().find(|t| t.id == *id) {
-                                let pos = FitsViewApp::render_pane(tab, &mut child, ctx, do_fit);
+                            if let Some(idx) =
+                                self.tabs.tabs.iter().position(|t| t.id == *id)
+                            {
+                                let tab = &mut self.tabs.tabs[idx];
+                                let pos = if tab.data.is_large() {
+                                    FitsViewApp::render_large_pane(
+                                        tab,
+                                        &mut child,
+                                        ctx,
+                                        do_fit,
+                                        &mut self.tile_manager,
+                                        self.renderer.as_ref(),
+                                        &mut missing_tiles,
+                                    )
+                                } else {
+                                    FitsViewApp::render_pane(tab, &mut child, ctx, do_fit)
+                                };
                                 if pane_idx == self.split_view.active_pane {
                                     new_cursor_pos = pos;
                                 }
@@ -477,11 +680,14 @@ impl eframe::App for FitsViewApp {
                         }
                     }
                 }
-                crate::split_view::SplitLayout::Grid2x2 => {
+                SplitLayout::Grid2x2 => {
                     let half_w = available.width() / 2.0;
                     let half_h = available.height() / 2.0;
                     let rects = [
-                        Rect::from_min_size(available.min, vec2(half_w - 1.0, half_h - 1.0)),
+                        Rect::from_min_size(
+                            available.min,
+                            vec2(half_w - 1.0, half_h - 1.0),
+                        ),
                         Rect::from_min_size(
                             available.min + vec2(half_w + 1.0, 0.0),
                             vec2(half_w - 1.0, half_h - 1.0),
@@ -496,29 +702,53 @@ impl eframe::App for FitsViewApp {
                         ),
                     ];
 
-                    // Dividers
                     ui.painter().line_segment(
                         [
                             available.min + vec2(half_w, 0.0),
                             available.min + vec2(half_w, available.height()),
                         ],
-                        egui::Stroke::new(2.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+                        egui::Stroke::new(
+                            2.0,
+                            ui.visuals().widgets.noninteractive.bg_stroke.color,
+                        ),
                     );
                     ui.painter().line_segment(
                         [
                             available.min + vec2(0.0, half_h),
                             available.min + vec2(available.width(), half_h),
                         ],
-                        egui::Stroke::new(2.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+                        egui::Stroke::new(
+                            2.0,
+                            ui.visuals().widgets.noninteractive.bg_stroke.color,
+                        ),
                     );
 
-                    let pane_ids: Vec<Option<u64>> = self.split_view.pane_tab_ids.clone();
+                    let pane_ids: Vec<Option<u64>> =
+                        self.split_view.pane_tab_ids.clone();
 
-                    for (pane_idx, (rect, tab_id)) in rects.iter().zip(pane_ids.iter()).enumerate() {
-                        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(*rect));
+                    for (pane_idx, (rect, tab_id)) in
+                        rects.iter().zip(pane_ids.iter()).enumerate()
+                    {
+                        let mut child =
+                            ui.new_child(egui::UiBuilder::new().max_rect(*rect));
                         if let Some(id) = tab_id {
-                            if let Some(tab) = self.tabs.tabs.iter_mut().find(|t| t.id == *id) {
-                                let pos = FitsViewApp::render_pane(tab, &mut child, ctx, do_fit);
+                            if let Some(idx) =
+                                self.tabs.tabs.iter().position(|t| t.id == *id)
+                            {
+                                let tab = &mut self.tabs.tabs[idx];
+                                let pos = if tab.data.is_large() {
+                                    FitsViewApp::render_large_pane(
+                                        tab,
+                                        &mut child,
+                                        ctx,
+                                        do_fit,
+                                        &mut self.tile_manager,
+                                        self.renderer.as_ref(),
+                                        &mut missing_tiles,
+                                    )
+                                } else {
+                                    FitsViewApp::render_pane(tab, &mut child, ctx, do_fit)
+                                };
                                 if pane_idx == self.split_view.active_pane {
                                     new_cursor_pos = pos;
                                 }
@@ -531,20 +761,49 @@ impl eframe::App for FitsViewApp {
                     }
                 }
             }
-
-            self.cursor_image_pos = new_cursor_pos;
         });
+
+        self.cursor_image_pos = new_cursor_pos;
+
+        // Submit tile requests after render
+        for (file_id, tx, ty) in missing_tiles {
+            let source = self.tabs.tabs.iter().find_map(|t| {
+                if let FileData::LargeImage(ref lis) = t.data {
+                    if lis.file_id == file_id {
+                        return Some(lis.source.clone());
+                    }
+                }
+                None
+            });
+            if let Some(src) = source {
+                self.tile_loader.request(TileRequest {
+                    key: TileKey {
+                        file_id,
+                        hdu: 0,
+                        tile_size: TileManager::TILE_SIZE,
+                        tx,
+                        ty,
+                    },
+                    source: src,
+                });
+            }
+        }
     }
 }
 
-/// Dispatch: try image load first, fall back to event-list binning.
 fn load_file(path: &Path) -> anyhow::Result<FileData> {
+    let file_size = std::fs::metadata(path)?.len();
+
+    if file_size > LARGE_FILE_THRESHOLD {
+        let mmap = MmapFitsImage::open(path, 0)?;
+        return Ok(FileData::LargeImage(LargeImageState { source: Arc::new(mmap), file_id: 0 }));
+    }
+
     match load_fits(path) {
         Ok(img) => Ok(FileData::Image(img)),
         Err(e) => {
             let msg = e.to_string();
             if msg.contains("BINTABLE") || msg.contains("TABLE") {
-                // Try event-list binning on the first BINTABLE (index 0)
                 let evt = bin_events(path, 0, 1.0)?;
                 Ok(FileData::Event(evt))
             } else {

@@ -7,8 +7,15 @@ use crate::tab_manager::{FileData, Tab};
 pub struct StatusBar;
 
 impl StatusBar {
-    /// Render the bottom status bar. Returns the cursor's image-space position if hovered.
-    pub fn show(ctx: &egui::Context, active_tab: Option<&Tab>, cursor_pos: Option<Pos2>) {
+    /// Render the bottom status bar.
+    ///
+    /// `tile_status`: `Some((pending, cache_mb))` for large-image tabs.
+    pub fn show(
+        ctx: &egui::Context,
+        active_tab: Option<&Tab>,
+        cursor_pos: Option<Pos2>,
+        tile_status: Option<(usize, usize)>,
+    ) {
         egui::TopBottomPanel::bottom("status_bar")
             .exact_height(24.0)
             .show(ctx, |ui| {
@@ -35,21 +42,40 @@ impl StatusBar {
                             ui.separator();
                         }
 
-                        // Center: cursor pixel value
-                        if let Some(pos) = cursor_pos {
-                            let px = pos.x as usize;
-                            let py = pos.y as usize;
-                            let w = tab.data.width();
-                            let h = tab.data.height();
-                            if px < w && py < h {
-                                let val = tab.data.pixel_data()[py * w + px];
+                        // Tile loading progress for large images
+                        if let Some((pending, cache_mb)) = tile_status {
+                            if pending > 0 {
                                 ui.label(
-                                    egui::RichText::new(format!(
-                                        "({px}, {py}) = {val:.4}"
-                                    ))
-                                    .monospace(),
+                                    egui::RichText::new(format!("Loading {pending} tiles…"))
+                                        .monospace()
+                                        .color(egui::Color32::from_rgb(255, 200, 80)),
                                 );
                                 ui.separator();
+                            }
+                            ui.label(
+                                egui::RichText::new(format!("Cache: {cache_mb} MB"))
+                                    .monospace()
+                                    .weak(),
+                            );
+                            ui.separator();
+                        }
+
+                        // Center: cursor pixel value (small images only)
+                        if !tab.data.is_large() {
+                            if let Some(pos) = cursor_pos {
+                                let px = pos.x as usize;
+                                let py = pos.y as usize;
+                                let w = tab.data.width();
+                                let h = tab.data.height();
+                                let data = tab.data.pixel_data();
+                                if px < w && py < h && !data.is_empty() {
+                                    let val = data[py * w + px];
+                                    ui.label(
+                                        egui::RichText::new(format!("({px}, {py}) = {val:.4}"))
+                                            .monospace(),
+                                    );
+                                    ui.separator();
+                                }
                             }
                         }
 

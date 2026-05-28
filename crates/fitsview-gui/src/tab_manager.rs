@@ -1,18 +1,27 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use egui::TextureHandle;
 use fitsview_core::{
     colormap::Colormap,
     event_image::EventImage,
     fits_reader::FitsImage,
+    mmap_reader::MmapFitsImage,
     scale::{ScaleMode, ScaleResult},
 };
 
 use crate::viewport::ViewState;
 
+pub struct LargeImageState {
+    pub source: Arc<MmapFitsImage>,
+    pub file_id: u64,
+}
+
 pub enum FileData {
     Image(FitsImage),
     Event(EventImage),
+    LargeImage(LargeImageState),
 }
 
 impl FileData {
@@ -20,6 +29,7 @@ impl FileData {
         match self {
             FileData::Image(i) => i.width,
             FileData::Event(e) => e.width,
+            FileData::LargeImage(l) => l.source.width,
         }
     }
 
@@ -27,6 +37,7 @@ impl FileData {
         match self {
             FileData::Image(i) => i.height,
             FileData::Event(e) => e.height,
+            FileData::LargeImage(l) => l.source.height,
         }
     }
 
@@ -34,18 +45,24 @@ impl FileData {
         match self {
             FileData::Image(i) => &i.data,
             FileData::Event(e) => &e.data,
+            FileData::LargeImage(_) => &[],
         }
     }
 
-    pub fn header(&self) -> &std::collections::HashMap<String, String> {
+    pub fn header(&self) -> &HashMap<String, String> {
         match self {
             FileData::Image(i) => &i.header,
             FileData::Event(e) => &e.header,
+            FileData::LargeImage(l) => &l.source.header,
         }
     }
 
     pub fn is_event(&self) -> bool {
         matches!(self, FileData::Event(_))
+    }
+
+    pub fn is_large(&self) -> bool {
+        matches!(self, FileData::LargeImage(_))
     }
 }
 
@@ -62,6 +79,8 @@ pub struct Tab {
     pub needs_retexture: bool,
     pub needs_fit: bool,
     pub error: Option<String>,
+    /// Per-tile textures for LargeImage rendering: key = (tx, ty)
+    pub tile_textures: HashMap<(usize, usize), TextureHandle>,
 }
 
 impl Tab {
@@ -79,6 +98,7 @@ impl Tab {
             needs_retexture: true,
             needs_fit: true,
             error: None,
+            tile_textures: HashMap::new(),
         }
     }
 
