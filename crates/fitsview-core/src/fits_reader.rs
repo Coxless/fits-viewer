@@ -35,7 +35,10 @@ pub fn list_hdus(path: &Path) -> anyhow::Result<Vec<HduInfo>> {
     let mut result = Vec::new();
 
     for (idx, hdu_result) in hdu_list.enumerate() {
-        let hdu = hdu_result?;
+        let hdu = match hdu_result {
+            Ok(h) => h,
+            Err(_) => break, // fitsrs can error at EOF after the last HDU
+        };
         match hdu {
             HDU::Primary(h) | HDU::XImage(h) => {
                 let xt = h.get_header().get_xtension();
@@ -168,8 +171,7 @@ pub fn load_fits(path: &Path) -> anyhow::Result<FitsImage> {
             Some(Ok(HDU::XBinaryTable(_))) | Some(Ok(HDU::XASCIITable(_))) => {
                 has_table = true;
             }
-            Some(Err(e)) => return Err(e.into()),
-            None => {
+            Some(Err(_)) | None => {
                 if has_table {
                     anyhow::bail!("FITS file contains table data (BINTABLE/TABLE) but no image HDU. Only image FITS files are supported.");
                 }

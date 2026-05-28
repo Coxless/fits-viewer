@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 
 use egui::{vec2, Color32, ColorImage, Rect, TextureHandle, TextureOptions, ViewportCommand};
 use fitsview_core::{
@@ -42,6 +42,9 @@ pub struct FitsViewApp {
     #[allow(dead_code)] // keeps the tokio runtime alive for tile loading tasks
     tokio_rt: Arc<tokio::runtime::Runtime>,
     renderer: Box<dyn Renderer>,
+    // Background file loading
+    load_tx: mpsc::Sender<(u64, anyhow::Result<FileData>)>,
+    load_rx: mpsc::Receiver<(u64, anyhow::Result<FileData>)>,
 }
 
 impl FitsViewApp {
@@ -59,6 +62,8 @@ impl FitsViewApp {
         #[cfg(not(feature = "gpu"))]
         let renderer = { let _ = cc; create_renderer() };
 
+        let (load_tx, load_rx) = mpsc::channel();
+
         let mut app = Self {
             tabs: TabManager::default(),
             file_explorer: FileExplorer::default(),
@@ -73,6 +78,8 @@ impl FitsViewApp {
             tile_loader,
             tokio_rt,
             renderer,
+            load_tx,
+            load_rx,
         };
 
         if let Some(dir) = initial_dir {
@@ -87,20 +94,24 @@ impl FitsViewApp {
     }
 
     fn open_file(&mut self, path: &Path) {
-        match load_file(path) {
-            Ok(mut data) => {
-                // For large images, assign a file_id from the tile manager
-                if let FileData::LargeImage(ref mut lis) = data {
-                    lis.file_id = self.tile_manager.register_file();
-                }
-                self.tabs.open(path.to_path_buf(), data);
-                let tab_id = self.tabs.active_id.unwrap();
-                self.split_view.assign_active(tab_id);
-            }
-            Err(e) => {
-                log::error!("Failed to open {}: {e}", path.display());
-            }
+        // If already open, just activate the existing tab
+        if let Some(existing) = self.tabs.tabs.iter().find(|t| t.path == path) {
+            let id = existing.id;
+            self.tabs.set_active(id);
+            self.split_view.assign_active(id);
+            return;
         }
+
+        // Create the tab immediately in Loading state so the viewport appears
+        let tab_id = self.tabs.open(path.to_path_buf(), FileData::Loading);
+        self.split_view.assign_active(tab_id);
+
+        // Read the file on a background thread
+        let tx = self.load_tx.clone();
+        let path = path.to_path_buf();
+        std::thread::spawn(move || {
+            let _ = tx.send((tab_id, load_file(&path)));
+        });
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) -> bool {
@@ -286,6 +297,41 @@ impl FitsViewApp {
                 self.file_explorer.set_root(p);
                 self.file_explorer.visible = true;
             }
+        }
+    }
+
+    // --- Loading / error state rendering ---
+
+    fn render_loading_pane(tab: &Tab, ui: &mut egui::Ui) {
+        let available = ui.available_rect_before_wrap();
+        // Consume the whole rect so nothing else draws here
+        ui.allocate_rect(available, egui::Sense::hover());
+
+        if let Some(ref err) = tab.error {
+            ui.painter().text(
+                available.center(),
+                egui::Align2::CENTER_CENTER,
+                format!("Error loading file:\n{err}"),
+                egui::FontId::proportional(13.0),
+                egui::Color32::from_rgb(255, 80, 80),
+            );
+        } else {
+            // Spinner above, label below
+            let spinner_center = available.center() - egui::vec2(0.0, 14.0);
+            let spinner_rect =
+                egui::Rect::from_center_size(spinner_center, egui::vec2(28.0, 28.0));
+            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(spinner_rect));
+            child.add(egui::Spinner::new().size(28.0));
+
+            ui.painter().text(
+                available.center() + egui::vec2(0.0, 22.0),
+                egui::Align2::CENTER_CENTER,
+                format!("Loading {}…", tab.title()),
+                egui::FontId::proportional(13.0),
+                ui.visuals().weak_text_color(),
+            );
+            // Keep repainting so the spinner animates
+            ui.ctx().request_repaint();
         }
     }
 
@@ -533,6 +579,23 @@ impl eframe::App for FitsViewApp {
             .unwrap_or_else(|| "fits-view".to_owned());
         ctx.send_viewport_cmd(ViewportCommand::Title(title));
 
+        // Drain completed background file loads
+        while let Ok((tab_id, result)) = self.load_rx.try_recv() {
+            match result {
+                Ok(mut data) => {
+                    if let FileData::LargeImage(ref mut lis) = data {
+                        lis.file_id = self.tile_manager.register_file();
+                    }
+                    self.tabs.finish_loading(tab_id, data);
+                }
+                Err(e) => {
+                    log::error!("Background load failed for tab {tab_id}: {e}");
+                    self.tabs.set_load_error(tab_id, e.to_string());
+                }
+            }
+            ctx.request_repaint();
+        }
+
         // Drain completed tile loads
         {
             let completed = self.tile_loader.poll_completed();
@@ -601,7 +664,9 @@ impl eframe::App for FitsViewApp {
                             self.tabs.tabs.iter().position(|t| t.id == id)
                         {
                             let tab = &mut self.tabs.tabs[idx];
-                            if tab.data.is_large() {
+                            if tab.data.is_loading() {
+                                FitsViewApp::render_loading_pane(tab, ui);
+                            } else if tab.data.is_large() {
                                 new_cursor_pos = FitsViewApp::render_large_pane(
                                     tab,
                                     ui,
@@ -657,7 +722,10 @@ impl eframe::App for FitsViewApp {
                                 self.tabs.tabs.iter().position(|t| t.id == *id)
                             {
                                 let tab = &mut self.tabs.tabs[idx];
-                                let pos = if tab.data.is_large() {
+                                let pos = if tab.data.is_loading() {
+                                    FitsViewApp::render_loading_pane(tab, &mut child);
+                                    None
+                                } else if tab.data.is_large() {
                                     FitsViewApp::render_large_pane(
                                         tab,
                                         &mut child,
@@ -737,7 +805,10 @@ impl eframe::App for FitsViewApp {
                                 self.tabs.tabs.iter().position(|t| t.id == *id)
                             {
                                 let tab = &mut self.tabs.tabs[idx];
-                                let pos = if tab.data.is_large() {
+                                let pos = if tab.data.is_loading() {
+                                    FitsViewApp::render_loading_pane(tab, &mut child);
+                                    None
+                                } else if tab.data.is_large() {
                                     FitsViewApp::render_large_pane(
                                         tab,
                                         &mut child,

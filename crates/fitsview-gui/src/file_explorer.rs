@@ -106,13 +106,51 @@ impl FileExplorer {
                         } else {
                             String::new()
                         };
-                        let text = if is_fits {
-                            egui::RichText::new(format!("📄 {name}{size_badge}")).monospace()
+                        let label_text = if is_fits {
+                            format!("📄 {name}{size_badge}")
                         } else {
-                            egui::RichText::new(format!("  {name}")).monospace().weak()
+                            format!("  {name}")
                         };
+                        let font_id = egui::TextStyle::Monospace.resolve(ui.style());
+                        let row_height =
+                            ui.text_style_height(&egui::TextStyle::Monospace) + 4.0;
+                        let sense = if is_fits {
+                            egui::Sense::click()
+                        } else {
+                            egui::Sense::hover()
+                        };
+                        let (row_rect, resp) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), row_height),
+                            sense,
+                        );
 
-                        let resp = ui.add(egui::Label::new(text).sense(egui::Sense::click()));
+                        if ui.is_rect_visible(row_rect) {
+                            if is_fits && resp.hovered() {
+                                ui.painter().rect_filled(
+                                    row_rect,
+                                    2.0,
+                                    ui.visuals().widgets.hovered.weak_bg_fill,
+                                );
+                            }
+                            let text_color = if is_fits {
+                                ui.visuals().text_color()
+                            } else {
+                                ui.visuals().weak_text_color()
+                            };
+                            ui.painter().text(
+                                egui::pos2(row_rect.left() + 4.0, row_rect.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                label_text,
+                                font_id,
+                                text_color,
+                            );
+                        }
+
+                        let resp = if is_fits {
+                            resp.on_hover_cursor(egui::CursorIcon::Default)
+                        } else {
+                            resp
+                        };
                         if is_fits && resp.clicked() {
                             to_open = Some(path.clone());
                         }

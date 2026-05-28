@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use egui::TextureHandle;
 use fitsview_core::{
@@ -13,12 +13,15 @@ use fitsview_core::{
 
 use crate::viewport::ViewState;
 
+static EMPTY_HEADER: OnceLock<HashMap<String, String>> = OnceLock::new();
+
 pub struct LargeImageState {
     pub source: Arc<MmapFitsImage>,
     pub file_id: u64,
 }
 
 pub enum FileData {
+    Loading,
     Image(FitsImage),
     Event(EventImage),
     LargeImage(LargeImageState),
@@ -27,6 +30,7 @@ pub enum FileData {
 impl FileData {
     pub fn width(&self) -> usize {
         match self {
+            FileData::Loading => 0,
             FileData::Image(i) => i.width,
             FileData::Event(e) => e.width,
             FileData::LargeImage(l) => l.source.width,
@@ -35,6 +39,7 @@ impl FileData {
 
     pub fn height(&self) -> usize {
         match self {
+            FileData::Loading => 0,
             FileData::Image(i) => i.height,
             FileData::Event(e) => e.height,
             FileData::LargeImage(l) => l.source.height,
@@ -43,6 +48,7 @@ impl FileData {
 
     pub fn pixel_data(&self) -> &[f32] {
         match self {
+            FileData::Loading => &[],
             FileData::Image(i) => &i.data,
             FileData::Event(e) => &e.data,
             FileData::LargeImage(_) => &[],
@@ -51,10 +57,15 @@ impl FileData {
 
     pub fn header(&self) -> &HashMap<String, String> {
         match self {
+            FileData::Loading => EMPTY_HEADER.get_or_init(HashMap::new),
             FileData::Image(i) => &i.header,
             FileData::Event(e) => &e.header,
             FileData::LargeImage(l) => &l.source.header,
         }
+    }
+
+    pub fn is_loading(&self) -> bool {
+        matches!(self, FileData::Loading)
     }
 
     pub fn is_event(&self) -> bool {
@@ -123,17 +134,35 @@ impl Default for TabManager {
 }
 
 impl TabManager {
-    pub fn open(&mut self, path: PathBuf, data: FileData) {
-        // If a tab for this path already exists, activate it
+    /// Open a tab for `path` with `data`. Returns the tab id.
+    /// If a tab for this path already exists, activates it and returns its id.
+    pub fn open(&mut self, path: PathBuf, data: FileData) -> u64 {
         if let Some(t) = self.tabs.iter().find(|t| t.path == path) {
             let id = t.id;
             self.active_id = Some(id);
-            return;
+            return id;
         }
         let id = self.next_id;
         self.next_id += 1;
         self.tabs.push(Tab::new(id, path, data, 0));
         self.active_id = Some(id);
+        id
+    }
+
+    /// Replace a Loading tab's data once the background load completes.
+    pub fn finish_loading(&mut self, tab_id: u64, data: FileData) {
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+            tab.data = data;
+            tab.needs_fit = true;
+            tab.needs_retexture = true;
+        }
+    }
+
+    /// Mark a Loading tab as having failed.
+    pub fn set_load_error(&mut self, tab_id: u64, error: String) {
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+            tab.error = Some(error);
+        }
     }
 
     pub fn close_active(&mut self) {
