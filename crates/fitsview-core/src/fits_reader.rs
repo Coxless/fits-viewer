@@ -171,13 +171,13 @@ pub fn load_fits_hdu(path: &Path, hdu_index: usize) -> anyhow::Result<FitsImage>
     }
 }
 
-fn value_to_string(val: &fitsrs::card::Value) -> String {
+pub(crate) fn value_to_string(val: &fitsrs::card::Value) -> String {
     use fitsrs::card::Value;
     match val {
         Value::Integer { value: v, .. } => v.to_string(),
         Value::Float { value: v, .. } => format!("{v:.10}"),
         Value::Logical { value: v, .. } => if *v { "T" } else { "F" }.to_owned(),
-        Value::String { value: v, .. } => v.clone(),
+        Value::String { value: v, .. } => v.trim().to_owned(),
         Value::Undefined => String::new(),
         Value::Invalid(s) => s.clone(),
     }

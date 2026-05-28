@@ -58,9 +58,11 @@ impl TileLoader {
         if self.in_flight.contains(&req.key) {
             return;
         }
-        self.in_flight.insert(req.key.clone());
-        self.pending += 1;
-        let _ = self.request_tx.try_send(req);
+        let key = req.key.clone();
+        if self.request_tx.try_send(req).is_ok() {
+            self.in_flight.insert(key);
+            self.pending += 1;
+        }
     }
 
     /// Drain completed tiles; call once per frame.
