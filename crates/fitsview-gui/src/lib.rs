@@ -3,6 +3,7 @@ pub mod command_palette;
 pub mod dir_watcher;
 pub mod file_explorer;
 pub mod header_panel;
+pub mod renderer;
 pub mod split_view;
 pub mod status_bar;
 pub mod tab_manager;
