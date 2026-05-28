@@ -74,7 +74,7 @@ impl FileExplorer {
                                 .map(|n| n.to_string_lossy().into_owned())
                                 .unwrap_or_else(|| root.to_string_lossy().into_owned()),
                         )
-                        .small()
+                        .size(16.0)
                         .weak(),
                     );
                     ui.separator();
@@ -111,9 +111,8 @@ impl FileExplorer {
                         } else {
                             format!("  {name}")
                         };
-                        let font_id = egui::TextStyle::Monospace.resolve(ui.style());
-                        let row_height =
-                            ui.text_style_height(&egui::TextStyle::Monospace) + 4.0;
+                        let font_id = egui::FontId::monospace(14.0);
+                        let row_height = 18.0;
                         let sense = if is_fits {
                             egui::Sense::click()
                         } else {

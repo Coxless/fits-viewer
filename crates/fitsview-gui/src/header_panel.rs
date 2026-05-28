@@ -23,8 +23,9 @@ impl HeaderPanel {
             .show(ctx, |ui| {
                 ui.heading("FITS Header");
                 ui.separator();
-                ui.label("Search:");
-                ui.text_edit_singleline(&mut self.search);
+                ui.label(egui::RichText::new("Search:").size(14.0));
+                ui.add(egui::TextEdit::singleline(&mut self.search)
+                    .font(egui::FontId::proportional(14.0)));
                 ui.separator();
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     let search_lower = self.search.to_ascii_lowercase();
@@ -37,8 +38,8 @@ impl HeaderPanel {
                             || val.to_ascii_lowercase().contains(&search_lower)
                         {
                             ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new(key).monospace().strong());
-                                ui.label(egui::RichText::new(val).monospace());
+                                ui.label(egui::RichText::new(key).monospace().size(14.0).strong());
+                                ui.label(egui::RichText::new(val).monospace().size(14.0));
                             });
                         }
                     }
