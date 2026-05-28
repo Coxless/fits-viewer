@@ -44,6 +44,8 @@ fn main() -> anyhow::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("fits-view")
             .with_inner_size([1200.0, 800.0]),
+        #[cfg(feature = "gpu")]
+        renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
 

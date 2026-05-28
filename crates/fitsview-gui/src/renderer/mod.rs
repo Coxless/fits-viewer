@@ -1,10 +1,11 @@
 use fitsview_core::{colormap::Colormap, scale::ScaleMode};
 
 pub mod cpu;
-#[cfg(feature = "wgpu")]
+#[cfg(feature = "gpu")]
 pub mod gpu;
 
 pub trait Renderer: Send {
+    #[allow(clippy::too_many_arguments)]
     fn render(
         &self,
         pixels: &[f32],
@@ -17,19 +18,19 @@ pub trait Renderer: Send {
     ) -> Vec<u8>;
 }
 
-#[cfg(feature = "wgpu")]
+#[cfg(feature = "gpu")]
 pub fn create_renderer(
-    render_state: Option<&egui_wgpu::RenderState>,
+    render_state: Option<&eframe::egui_wgpu::RenderState>,
 ) -> Box<dyn Renderer> {
     if let Some(rs) = render_state {
-        if let Some(gpu) = gpu::GpuRenderer::try_new(rs) {
-            return Box::new(gpu);
+        if let Some(g) = gpu::GpuRenderer::try_new(rs) {
+            return Box::new(g);
         }
     }
     Box::new(cpu::CpuRenderer)
 }
 
-#[cfg(not(feature = "wgpu"))]
+#[cfg(not(feature = "gpu"))]
 pub fn create_renderer() -> Box<dyn Renderer> {
     Box::new(cpu::CpuRenderer)
 }

@@ -39,6 +39,7 @@ pub struct FitsViewApp {
     // Large-file tile infrastructure
     tile_manager: TileManager,
     tile_loader: TileLoader,
+    #[allow(dead_code)] // keeps the tokio runtime alive for tile loading tasks
     tokio_rt: Arc<tokio::runtime::Runtime>,
     renderer: Box<dyn Renderer>,
 }
@@ -53,11 +54,10 @@ impl FitsViewApp {
         let tile_loader = TileLoader::new(&tokio_rt);
         let tile_manager = TileManager::new(TileManager::MAX_MEMORY);
 
-        #[cfg(feature = "wgpu")]
+        #[cfg(feature = "gpu")]
         let renderer = create_renderer(cc.wgpu_render_state.as_ref());
-        #[cfg(not(feature = "wgpu"))]
-        let renderer = create_renderer();
-        let _ = cc; // suppress unused warning when wgpu feature is off
+        #[cfg(not(feature = "gpu"))]
+        let renderer = { let _ = cc; create_renderer() };
 
         let mut app = Self {
             tabs: TabManager::default(),
@@ -357,6 +357,7 @@ impl FitsViewApp {
 
     // --- Large-image tile rendering ---
 
+    #[allow(clippy::too_many_arguments)]
     fn render_large_pane(
         tab: &mut Tab,
         ui: &mut egui::Ui,

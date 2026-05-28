@@ -104,45 +104,35 @@ impl MmapFitsImage {
     }
 }
 
-fn decode_row(slice: &[u8], bitpix: Bitpix, n: usize, out: &mut Vec<f32>) {
+fn decode_row(slice: &[u8], bitpix: Bitpix, _n: usize, out: &mut Vec<f32>) {
     match bitpix {
         Bitpix::U8 => {
-            for i in 0..n {
-                out.push(slice[i] as f32);
-            }
+            out.extend(slice.iter().map(|&b| b as f32));
         }
         Bitpix::I16 => {
-            for i in 0..n {
-                let b = &slice[i * 2..i * 2 + 2];
-                out.push(i16::from_be_bytes([b[0], b[1]]) as f32);
-            }
+            out.extend(slice.chunks_exact(2).map(|b| {
+                i16::from_be_bytes([b[0], b[1]]) as f32
+            }));
         }
         Bitpix::I32 => {
-            for i in 0..n {
-                let b = &slice[i * 4..i * 4 + 4];
-                out.push(i32::from_be_bytes([b[0], b[1], b[2], b[3]]) as f32);
-            }
+            out.extend(slice.chunks_exact(4).map(|b| {
+                i32::from_be_bytes([b[0], b[1], b[2], b[3]]) as f32
+            }));
         }
         Bitpix::I64 => {
-            for i in 0..n {
-                let b = &slice[i * 8..i * 8 + 8];
-                out.push(i64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
-                    as f32);
-            }
+            out.extend(slice.chunks_exact(8).map(|b| {
+                i64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f32
+            }));
         }
         Bitpix::F32 => {
-            for i in 0..n {
-                let b = &slice[i * 4..i * 4 + 4];
-                out.push(f32::from_be_bytes([b[0], b[1], b[2], b[3]]));
-            }
+            out.extend(slice.chunks_exact(4).map(|b| {
+                f32::from_be_bytes([b[0], b[1], b[2], b[3]])
+            }));
         }
         Bitpix::F64 => {
-            for i in 0..n {
-                let b = &slice[i * 8..i * 8 + 8];
-                out.push(
-                    f64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f32,
-                );
-            }
+            out.extend(slice.chunks_exact(8).map(|b| {
+                f64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f32
+            }));
         }
     }
 }

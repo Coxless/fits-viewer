@@ -6,6 +6,7 @@ use super::Renderer;
 pub struct CpuRenderer;
 
 impl Renderer for CpuRenderer {
+    #[allow(clippy::too_many_arguments)]
     fn render(
         &self,
         pixels: &[f32],
