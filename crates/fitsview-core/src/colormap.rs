@@ -1,6 +1,6 @@
 use std::sync::OnceLock;
 
-use crate::scale::{apply_transfer, ScaleMode};
+use crate::scale::{apply_contrast_bias, apply_transfer, ScaleMode};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Colormap {
@@ -25,11 +25,32 @@ pub fn apply_colormap(value: f32, cmap: Colormap) -> [u8; 4] {
     [r, g, b, 255]
 }
 
-pub fn render_to_rgba(data: &[f32], vmin: f32, vmax: f32, cmap: Colormap, scale_mode: ScaleMode) -> Vec<u8> {
+/// Render pixel data to RGBA with optional HistEq LUT and contrast/bias adjustment.
+///
+/// - `histeq_lut`: 65536-entry LUT from `build_histeq_lut`; applied when `scale_mode == HistEq`.
+/// - `contrast` / `bias`: DS9-style stretch. Pass `1.0` / `0.5` for no adjustment.
+#[allow(clippy::too_many_arguments)]
+pub fn render_to_rgba(
+    data: &[f32],
+    vmin: f32,
+    vmax: f32,
+    cmap: Colormap,
+    scale_mode: ScaleMode,
+    contrast: f32,
+    bias: f32,
+    histeq_lut: Option<&[f32]>,
+) -> Vec<u8> {
     let range = (vmax - vmin).max(f32::EPSILON);
     let mut rgba = Vec::with_capacity(data.len() * 4);
     for &v in data {
-        let t = apply_transfer(((v - vmin) / range).clamp(0.0, 1.0), scale_mode);
+        let norm = ((v - vmin) / range).clamp(0.0, 1.0);
+        let t = apply_transfer(norm, scale_mode);
+        let t = if let Some(lut) = histeq_lut {
+            lut[(t * 65535.0).clamp(0.0, 65535.0) as usize]
+        } else {
+            t
+        };
+        let t = apply_contrast_bias(t, contrast, bias);
         let [r, g, b, a] = apply_colormap(t, cmap);
         rgba.extend_from_slice(&[r, g, b, a]);
     }
@@ -188,7 +209,7 @@ mod tests {
     #[test]
     fn test_render_to_rgba_length() {
         let data = vec![0.0_f32, 0.5, 1.0];
-        let result = render_to_rgba(&data, 0.0, 1.0, Colormap::Viridis, crate::scale::ScaleMode::Linear);
+        let result = render_to_rgba(&data, 0.0, 1.0, Colormap::Viridis, crate::scale::ScaleMode::Linear, 1.0, 0.5, None);
         assert_eq!(result.len(), 12);
     }
 

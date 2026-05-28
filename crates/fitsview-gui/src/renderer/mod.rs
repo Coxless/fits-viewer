@@ -4,18 +4,23 @@ pub mod cpu;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 
+/// All parameters needed to render a pixel buffer to RGBA.
+pub struct RenderParams<'a> {
+    pub pixels: &'a [f32],
+    pub width: usize,
+    pub height: usize,
+    pub vmin: f32,
+    pub vmax: f32,
+    pub scale_mode: ScaleMode,
+    pub colormap: Colormap,
+    pub contrast: f32,
+    pub bias: f32,
+    /// 65536-entry HistEq LUT from `build_histeq_lut`; None when not using HistEq.
+    pub histeq_lut: Option<&'a [f32]>,
+}
+
 pub trait Renderer: Send {
-    #[allow(clippy::too_many_arguments)]
-    fn render(
-        &self,
-        pixels: &[f32],
-        width: usize,
-        height: usize,
-        vmin: f32,
-        vmax: f32,
-        scale_mode: ScaleMode,
-        colormap: Colormap,
-    ) -> Vec<u8>;
+    fn render(&self, params: &RenderParams<'_>) -> Vec<u8>;
 }
 
 #[cfg(feature = "gpu")]
