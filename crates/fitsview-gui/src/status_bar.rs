@@ -4,6 +4,7 @@ use fitsview_core::scale::ScaleMode;
 use fitsview_core::wcs::Wcs;
 
 use crate::tab_manager::{FileData, Tab};
+use crate::theme;
 
 pub struct StatusBar;
 
@@ -21,67 +22,73 @@ impl StatusBar {
         blink_interval: Option<f32>,
     ) {
         egui::TopBottomPanel::bottom("status_bar")
-            .exact_height(24.0)
+            .frame(theme::status_bar_frame())
+            .exact_height(26.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 12.0;
+                    ui.spacing_mut().item_spacing.x = 0.0;
 
                     if let Some(tab) = active_tab {
+                        let dot = egui::RichText::new("  ·  ").size(12.0).color(theme::SEPARATOR);
+
                         // Left: filename
                         let fname = tab.title();
-                        ui.label(egui::RichText::new(&fname).monospace());
+                        ui.label(egui::RichText::new(&fname).monospace().size(12.5).color(theme::TEXT_PRIMARY));
 
                         // HDU indicator
                         if tab.hdu_list.len() > 1 {
-                            ui.separator();
+                            ui.label(dot.clone());
                             ui.label(
                                 egui::RichText::new(format!("HDU {}/{}", tab.hdu_index, tab.hdu_list.len() - 1))
                                     .monospace()
-                                    .color(egui::Color32::from_rgb(180, 180, 255)),
+                                    .size(12.5)
+                                    .color(theme::HDU_COLOR),
                             );
                         }
 
-                        ui.separator();
-
                         // Event mode indicator
                         if let FileData::Event(e) = &tab.data {
+                            ui.label(dot.clone());
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "EVENTS | {}/{} | {} events | bin={:.1}",
+                                    "EVENTS  {}/{}  {} events  bin={:.1}",
                                     e.x_col, e.y_col, e.total_events, e.bin_size
                                 ))
                                 .monospace()
-                                .color(egui::Color32::from_rgb(100, 200, 255)),
+                                .size(12.5)
+                                .color(theme::EVENTS_COLOR),
                             );
-                            ui.separator();
                         }
 
                         // Tile loading progress for large images
                         if let Some((pending, cache_mb)) = tile_status {
                             if pending > 0 {
+                                ui.label(dot.clone());
                                 ui.label(
                                     egui::RichText::new(format!("Loading {pending} tiles…"))
                                         .monospace()
-                                        .color(egui::Color32::from_rgb(255, 200, 80)),
+                                        .size(12.5)
+                                        .color(theme::LOADING_COLOR),
                                 );
-                                ui.separator();
                             }
+                            ui.label(dot.clone());
                             ui.label(
-                                egui::RichText::new(format!("Cache: {cache_mb} MB"))
+                                egui::RichText::new(format!("Cache {cache_mb} MB"))
                                     .monospace()
-                                    .weak(),
+                                    .size(12.5)
+                                    .color(theme::TEXT_MUTED),
                             );
-                            ui.separator();
                         }
 
                         // Blink indicator
                         if let Some(interval) = blink_interval {
+                            ui.label(dot.clone());
                             ui.label(
                                 egui::RichText::new(format!("BLINK {interval:.1}s"))
                                     .monospace()
-                                    .color(egui::Color32::from_rgb(255, 200, 0)),
+                                    .size(12.5)
+                                    .color(theme::BLINK_COLOR),
                             );
-                            ui.separator();
                         }
 
                         // Cursor position: pixel value + optional WCS coords
@@ -94,28 +101,29 @@ impl StatusBar {
                                 let data = tab.data.pixel_data();
                                 if px < w && py < h && !data.is_empty() {
                                     let val = data[py * w + px];
+                                    ui.label(dot.clone());
                                     ui.label(
                                         egui::RichText::new(format!("({px}, {py}) = {val:.4}"))
-                                            .monospace(),
+                                            .monospace()
+                                            .size(12.5)
+                                            .color(theme::CURSOR_COLOR),
                                     );
 
-                                    // WCS coordinates
                                     if let Some(wcs) = &tab.wcs {
                                         if let Some((ra, dec)) = wcs.pixel_to_world(pos.x as f64, pos.y as f64) {
-                                            ui.separator();
+                                            ui.label(dot.clone());
                                             ui.label(
                                                 egui::RichText::new(format!(
-                                                    "RA {} Dec {}",
+                                                    "RA {}  Dec {}",
                                                     Wcs::format_ra(ra),
                                                     Wcs::format_dec(dec)
                                                 ))
                                                 .monospace()
-                                                .color(egui::Color32::from_rgb(150, 220, 150)),
+                                                .size(12.5)
+                                                .color(theme::CURSOR_COLOR),
                                             );
                                         }
                                     }
-
-                                    ui.separator();
                                 }
                             }
                         }
@@ -123,29 +131,46 @@ impl StatusBar {
                         // Right: scale + colormap + zoom
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.label(
-                                egui::RichText::new(format!("{:.2}x", tab.view.zoom))
-                                    .monospace(),
+                                egui::RichText::new(format!("{:.2}×", tab.view.zoom))
+                                    .monospace()
+                                    .size(12.5)
+                                    .color(theme::TEXT_OVERLAY),
                             );
-                            ui.separator();
-                            ui.label(egui::RichText::new(colormap_name(tab.colormap)).monospace());
-                            ui.separator();
-                            ui.label(egui::RichText::new(scale_name(tab.scale_mode)).monospace());
+                            ui.label(dot.clone());
+                            ui.label(
+                                egui::RichText::new(colormap_name(tab.colormap))
+                                    .monospace()
+                                    .size(12.5)
+                                    .color(theme::TEXT_OVERLAY),
+                            );
+                            ui.label(dot.clone());
+                            ui.label(
+                                egui::RichText::new(scale_name(tab.scale_mode))
+                                    .monospace()
+                                    .size(12.5)
+                                    .color(theme::TEXT_OVERLAY),
+                            );
 
-                            // Show contrast/bias if non-default
                             if (tab.contrast - 1.0).abs() > 0.01 || (tab.bias - 0.5).abs() > 0.01 {
-                                ui.separator();
+                                ui.label(dot.clone());
                                 ui.label(
                                     egui::RichText::new(format!(
-                                        "C:{:.2} B:{:.2}",
+                                        "C:{:.2}  B:{:.2}",
                                         tab.contrast, tab.bias
                                     ))
                                     .monospace()
-                                    .color(egui::Color32::from_rgb(200, 200, 100)),
+                                    .size(12.5)
+                                    .color(theme::SCALE_COLOR),
                                 );
                             }
                         });
                     } else {
-                        ui.label(egui::RichText::new("No file open").monospace().weak());
+                        ui.label(
+                            egui::RichText::new("No file open")
+                                .monospace()
+                                .size(12.5)
+                                .color(theme::TEXT_MUTED),
+                        );
                     }
                 });
             });

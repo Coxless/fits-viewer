@@ -260,46 +260,80 @@ impl TabManager {
 
     /// Draw the tab bar; returns the id that was clicked (if any).
     pub fn show_tab_bar(&mut self, ctx: &egui::Context) -> Option<u64> {
+        use crate::theme;
+
         let mut clicked = None;
         let mut close_id = None;
 
-        egui::TopBottomPanel::top("tab_bar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                let tab_ids: Vec<(u64, String)> =
-                    self.tabs.iter().map(|t| (t.id, t.title())).collect();
+        egui::TopBottomPanel::top("tab_bar")
+            .frame(theme::tab_bar_frame())
+            .exact_height(34.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    ui.spacing_mut().button_padding = egui::vec2(10.0, 6.0);
 
-                for (id, title) in tab_ids {
-                    let is_active = Some(id) == self.active_id;
-                    let label = if is_active {
-                        egui::RichText::new(&title).strong()
-                    } else {
-                        egui::RichText::new(&title)
-                    };
+                    let tab_ids: Vec<(u64, String)> =
+                        self.tabs.iter().map(|t| (t.id, t.title())).collect();
 
-                    ui.visuals_mut().widgets.inactive.bg_fill = if is_active {
-                        ui.visuals().selection.bg_fill
-                    } else {
-                        ui.visuals().widgets.inactive.bg_fill
-                    };
+                    for (id, title) in tab_ids {
+                        let is_active = Some(id) == self.active_id;
+                        let fill = if is_active { theme::BG_SELECTED } else { theme::BG_PANEL };
 
-                    if ui.add(egui::Button::new(label)).clicked() {
-                        clicked = Some(id);
+                        let label_text = egui::RichText::new(&title)
+                            .size(13.5)
+                            .color(if is_active { theme::TEXT_PRIMARY } else { theme::TEXT_OVERLAY });
+
+                        let tab_resp = ui.add(
+                            egui::Button::new(label_text)
+                                .fill(fill)
+                                .stroke(egui::Stroke::NONE)
+                                .rounding(egui::Rounding::ZERO)
+                                .min_size(egui::vec2(0.0, 34.0)),
+                        );
+
+                        if is_active {
+                            let r = tab_resp.rect;
+                            ui.painter().line_segment(
+                                [r.left_bottom(), r.right_bottom()],
+                                egui::Stroke::new(2.0, theme::ACCENT),
+                            );
+                        } else if tab_resp.hovered() {
+                            let r = tab_resp.rect;
+                            ui.painter().rect_filled(r, egui::Rounding::ZERO, theme::BG_HOVER);
+                        }
+
+                        if tab_resp.clicked() {
+                            clicked = Some(id);
+                        }
+
+                        let close_resp = ui.add(
+                            egui::Button::new(
+                                egui::RichText::new("×")
+                                    .size(14.0)
+                                    .color(theme::TEXT_MUTED),
+                            )
+                            .fill(fill)
+                            .stroke(egui::Stroke::NONE)
+                            .rounding(egui::Rounding::ZERO)
+                            .min_size(egui::vec2(24.0, 34.0)),
+                        );
+                        if close_resp.clicked() {
+                            close_id = Some(id);
+                        }
+
+                        let divider_rect = egui::Rect::from_min_size(
+                            close_resp.rect.right_top(),
+                            egui::vec2(1.0, 34.0),
+                        );
+                        ui.painter().rect_filled(
+                            divider_rect,
+                            egui::Rounding::ZERO,
+                            theme::SEPARATOR,
+                        );
                     }
-
-                    if ui
-                        .add(
-                            egui::Button::new("×")
-                                .min_size(egui::vec2(16.0, 0.0))
-                                .frame(false),
-                        )
-                        .clicked()
-                    {
-                        close_id = Some(id);
-                    }
-                    ui.separator();
-                }
+                });
             });
-        });
 
         if let Some(id) = close_id {
             if let Some(pos) = self.tabs.iter().position(|t| t.id == id) {
