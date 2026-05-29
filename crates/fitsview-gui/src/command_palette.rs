@@ -1,4 +1,4 @@
-use crate::theme;
+use crate::{annotation::ShapeType, theme};
 use fitsview_core::{colormap::Colormap, scale::ScaleMode};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -17,6 +17,12 @@ pub enum Command {
     ToggleBlink,
     ResetContrastBias,
     ToggleCrosshair,
+    ToggleHistogram,
+    ToggleWcsGrid,
+    ToggleLinkPanes,
+    SaveSession,
+    OpenSession,
+    AnnotationMode(ShapeType),
 }
 
 impl Command {
@@ -47,6 +53,15 @@ impl Command {
             Command::ToggleBlink        => "Toggle Blink (Ctrl+L)",
             Command::ResetContrastBias  => "Reset Contrast/Bias",
             Command::ToggleCrosshair    => "Toggle Crosshair (Ctrl+X)",
+            Command::ToggleHistogram    => "Toggle Histogram Panel",
+            Command::ToggleWcsGrid      => "Toggle WCS Grid",
+            Command::ToggleLinkPanes    => "Toggle Linked Pan/Zoom",
+            Command::SaveSession        => "Save Session",
+            Command::OpenSession        => "Open Session...",
+            Command::AnnotationMode(ShapeType::Circle) => "Annotate: Draw Circle",
+            Command::AnnotationMode(ShapeType::Box)    => "Annotate: Draw Box",
+            Command::AnnotationMode(ShapeType::Line)   => "Annotate: Draw Line",
+            Command::AnnotationMode(ShapeType::Text)   => "Annotate: Place Text",
         }
     }
 }
@@ -77,6 +92,15 @@ const ALL_COMMANDS: &[Command] = &[
     Command::ToggleBlink,
     Command::ResetContrastBias,
     Command::ToggleCrosshair,
+    Command::ToggleHistogram,
+    Command::ToggleWcsGrid,
+    Command::ToggleLinkPanes,
+    Command::SaveSession,
+    Command::OpenSession,
+    Command::AnnotationMode(ShapeType::Circle),
+    Command::AnnotationMode(ShapeType::Box),
+    Command::AnnotationMode(ShapeType::Line),
+    Command::AnnotationMode(ShapeType::Text),
 ];
 
 #[derive(Default)]

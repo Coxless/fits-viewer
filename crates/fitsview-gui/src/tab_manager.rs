@@ -5,6 +5,7 @@ use std::sync::{Arc, OnceLock};
 use egui::TextureHandle;
 use fitsview_core::{
     colormap::Colormap,
+    cube_reader::FitsCube,
     event_image::EventImage,
     fits_reader::{FitsImage, HduInfo},
     mmap_reader::MmapFitsImage,
@@ -14,7 +15,12 @@ use fitsview_core::{
     wcs::Wcs,
 };
 
-use crate::viewport::ViewState;
+use crate::{
+    annotation::Annotation,
+    cube_panel::CubePanel,
+    plot_panel::PlotPanel,
+    viewport::ViewState,
+};
 
 static EMPTY_HEADER: OnceLock<HashMap<String, String>> = OnceLock::new();
 
@@ -28,6 +34,7 @@ pub enum FileData {
     Image(FitsImage),
     Event(EventImage),
     LargeImage(LargeImageState),
+    Cube(Arc<FitsCube>),
 }
 
 impl FileData {
@@ -37,6 +44,7 @@ impl FileData {
             FileData::Image(i) => i.width,
             FileData::Event(e) => e.width,
             FileData::LargeImage(l) => l.source.width,
+            FileData::Cube(c) => c.width,
         }
     }
 
@@ -46,6 +54,7 @@ impl FileData {
             FileData::Image(i) => i.height,
             FileData::Event(e) => e.height,
             FileData::LargeImage(l) => l.source.height,
+            FileData::Cube(c) => c.height,
         }
     }
 
@@ -55,6 +64,7 @@ impl FileData {
             FileData::Image(i) => &i.data,
             FileData::Event(e) => &e.data,
             FileData::LargeImage(_) => &[],
+            FileData::Cube(_) => &[], // use slice_z() directly
         }
     }
 
@@ -64,6 +74,7 @@ impl FileData {
             FileData::Image(i) => &i.header,
             FileData::Event(e) => &e.header,
             FileData::LargeImage(l) => &l.source.header,
+            FileData::Cube(c) => &c.header,
         }
     }
 
@@ -77,6 +88,10 @@ impl FileData {
 
     pub fn is_large(&self) -> bool {
         matches!(self, FileData::LargeImage(_))
+    }
+
+    pub fn is_cube(&self) -> bool {
+        matches!(self, FileData::Cube(_))
     }
 }
 
@@ -115,6 +130,26 @@ pub struct Tab {
     pub region_files: Vec<RegionFile>,
     /// Show crosshair cursor
     pub crosshair: bool,
+    /// Manual vmin override (overrides scale_result.vmin when set)
+    pub vmin_override: Option<f32>,
+    /// Manual vmax override (overrides scale_result.vmax when set)
+    pub vmax_override: Option<f32>,
+    /// Cached histogram bins (counts per bin)
+    pub hist_bins: Option<Arc<Vec<u32>>>,
+    /// Cached histogram bin edges (n_bins + 1 values)
+    pub hist_edges: Option<Arc<Vec<f32>>>,
+    /// Background histogram computation in progress
+    pub hist_computing: bool,
+    /// Overlay RA/Dec grid lines on image
+    pub show_wcs_grid: bool,
+    /// GUI annotations drawn on this image
+    pub annotations: Vec<Annotation>,
+    /// Current z-slice index for cube data
+    pub cube_z: usize,
+    /// Cube navigation panel state
+    pub cube_panel: Option<CubePanel>,
+    /// Shared plot panel (spectrum extraction, 1D profile)
+    pub plot_panel: Option<PlotPanel>,
 }
 
 impl Tab {
@@ -144,6 +179,16 @@ impl Tab {
             histeq_lut: None,
             region_files: Vec::new(),
             crosshair: false,
+            vmin_override: None,
+            vmax_override: None,
+            hist_bins: None,
+            hist_edges: None,
+            hist_computing: false,
+            show_wcs_grid: false,
+            annotations: Vec::new(),
+            cube_z: 0,
+            cube_panel: None,
+            plot_panel: None,
         }
     }
 
@@ -194,6 +239,11 @@ impl TabManager {
             tab.histeq_lut = None;
             tab.stats = None;
             tab.stats_computing = false;
+            tab.vmin_override = None;
+            tab.vmax_override = None;
+            tab.hist_bins = None;
+            tab.hist_edges = None;
+            tab.hist_computing = false;
         }
     }
 

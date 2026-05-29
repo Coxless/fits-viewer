@@ -12,6 +12,9 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync"] }
 lru = "0.12"
 anyhow = { workspace = true }
 log = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+dirs = "5"
 
 [dev-dependencies]
 env_logger = { workspace = true }
