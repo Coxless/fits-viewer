@@ -1,8 +1,10 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use clap::{Parser, Subcommand};
 use eframe::egui;
+use rayon::prelude::*;
 
 use fitsview_core::{
     colormap::{render_to_rgba, Colormap},
@@ -21,17 +23,24 @@ struct Cli {
     /// FITS file(s) or directory to open (GUI mode).
     #[arg(num_args(0..))]
     paths: Vec<PathBuf>,
+
+    /// Load a saved session file (.fvs) before opening files.
+    #[arg(long)]
+    session: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
     /// Render a FITS image to PNG or JPEG
     Render {
-        /// Input FITS file
+        /// Input FITS file (or directory when --output-dir is given)
         input: PathBuf,
-        /// Output image file (.png or .jpg)
+        /// Output image file (.png or .jpg); omit when using --output-dir
         #[arg(short, long)]
-        output: PathBuf,
+        output: Option<PathBuf>,
+        /// Output directory for batch rendering (renders all image HDUs)
+        #[arg(long)]
+        output_dir: Option<PathBuf>,
         /// Output size as WxH (e.g. 256x256)
         #[arg(long, default_value = "256x256")]
         size: String,
@@ -44,6 +53,15 @@ enum Commands {
         /// HDU index (0-based)
         #[arg(long)]
         hdu: Option<usize>,
+        /// Manual vmin override (skips auto-scaling)
+        #[arg(long)]
+        vmin: Option<f32>,
+        /// Manual vmax override (skips auto-scaling)
+        #[arg(long)]
+        vmax: Option<f32>,
+        /// Number of parallel render jobs for batch mode
+        #[arg(long, default_value = "4")]
+        jobs: usize,
     },
     /// Print FITS header information
     Info {
@@ -66,6 +84,9 @@ enum Commands {
         /// Output format: table|json|csv
         #[arg(long, default_value = "table")]
         format: String,
+        /// Compute statistics only within this pixel region: x1:x2,y1:y2 (0-based)
+        #[arg(long)]
+        region: Option<String>,
     },
     /// Validate FITS file against conditions; exits 0 if all pass, 1 otherwise
     Check {
@@ -83,6 +104,9 @@ enum Commands {
         /// Require these FITS keywords to be present
         #[arg(long = "has-keyword")]
         has_keyword: Vec<String>,
+        /// Assert a header keyword expression, e.g. "NAXIS==2" or "BITPIX==-32"
+        #[arg(long = "assert")]
+        assert: Vec<String>,
     },
 }
 
@@ -92,19 +116,19 @@ fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Some(cmd) => run_headless(cmd),
-        None => run_gui(cli.paths),
+        None => run_gui(cli.paths, cli.session),
     }
 }
 
 fn run_headless(cmd: Commands) -> anyhow::Result<()> {
     match cmd {
-        Commands::Render { input, output, size, scale, colormap, hdu } => {
-            cmd_render(&input, &output, &size, &scale, &colormap, hdu)
+        Commands::Render { input, output, output_dir, size, scale, colormap, hdu, vmin, vmax, jobs } => {
+            cmd_render(&input, output.as_deref(), output_dir.as_deref(), &size, &scale, &colormap, hdu, vmin, vmax, jobs)
         }
         Commands::Info { input, format, hdu } => cmd_info(&input, &format, hdu),
-        Commands::Stats { input, hdu, format } => cmd_stats(&input, hdu, &format),
-        Commands::Check { input, min_width, min_height, has_wcs, has_keyword } => {
-            cmd_check(&input, min_width, min_height, has_wcs, &has_keyword)
+        Commands::Stats { input, hdu, format, region } => cmd_stats(&input, hdu, &format, region.as_deref()),
+        Commands::Check { input, min_width, min_height, has_wcs, has_keyword, assert } => {
+            cmd_check(&input, min_width, min_height, has_wcs, &has_keyword, &assert)
         }
     }
 }
@@ -142,56 +166,98 @@ fn parse_size(s: &str) -> anyhow::Result<(u32, u32)> {
     Ok((w, h))
 }
 
-fn cmd_render(
+#[allow(clippy::too_many_arguments)]
+fn render_one(
     input: &Path,
     output: &Path,
+    out_w: u32,
+    out_h: u32,
+    scale_mode: ScaleMode,
+    cmap: Colormap,
+    hdu: Option<usize>,
+    vmin: Option<f32>,
+    vmax: Option<f32>,
+) -> anyhow::Result<()> {
+    let img = if let Some(idx) = hdu { load_fits_hdu(input, idx)? } else { load_fits(input)? };
+
+    let (use_vmin, use_vmax) = if let (Some(mn), Some(mx)) = (vmin, vmax) {
+        (mn, mx)
+    } else {
+        let sr = compute_scale(&img.data, scale_mode);
+        (sr.vmin, sr.vmax)
+    };
+
+    let histeq_lut = if scale_mode == ScaleMode::HistEq {
+        Some(build_histeq_lut(&img.data, use_vmin, use_vmax))
+    } else {
+        None
+    };
+
+    let rgba = render_to_rgba(&img.data, use_vmin, use_vmax, cmap, scale_mode, 1.0, 0.5, histeq_lut.as_deref());
+    let src = image::RgbaImage::from_raw(img.width as u32, img.height as u32, rgba)
+        .ok_or_else(|| anyhow::anyhow!("Failed to create image buffer"))?;
+    let resized = image::imageops::resize(&src, out_w, out_h, image::imageops::FilterType::Lanczos3);
+    resized.save(output)?;
+    println!("Saved {}x{} → {}", out_w, out_h, output.display());
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_render(
+    input: &Path,
+    output: Option<&Path>,
+    output_dir: Option<&Path>,
     size: &str,
     scale: &str,
     colormap: &str,
     hdu: Option<usize>,
+    vmin: Option<f32>,
+    vmax: Option<f32>,
+    jobs: usize,
 ) -> anyhow::Result<()> {
     let scale_mode = parse_scale(scale)?;
     let cmap = parse_colormap(colormap)?;
     let (out_w, out_h) = parse_size(size)?;
 
-    let img = if let Some(idx) = hdu {
-        load_fits_hdu(input, idx)?
+    if let Some(out_dir) = output_dir {
+        // Batch mode: collect all FITS files from input (file or directory)
+        std::fs::create_dir_all(out_dir)?;
+        let files: Vec<PathBuf> = if input.is_dir() {
+            let mut v = Vec::new();
+            for entry in std::fs::read_dir(input)? {
+                let entry = entry?;
+                let p = entry.path();
+                if let Some(ext) = p.extension() {
+                    if matches!(ext.to_str().unwrap_or(""), "fits" | "fit" | "fts") {
+                        v.push(p);
+                    }
+                }
+            }
+            v
+        } else {
+            vec![input.to_path_buf()]
+        };
+
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(jobs).build()?;
+        let errors: Vec<String> = pool.install(|| {
+            files.par_iter().filter_map(|f| {
+                let stem = f.file_stem().unwrap_or_default().to_string_lossy();
+                let out = out_dir.join(format!("{stem}.png"));
+                render_one(f, &out, out_w, out_h, scale_mode, cmap, None, vmin, vmax).err()
+                    .map(|e| format!("{}: {e}", f.display()))
+            }).collect()
+        });
+        for e in &errors {
+            eprintln!("ERROR: {e}");
+        }
+        if !errors.is_empty() {
+            anyhow::bail!("{} file(s) failed to render", errors.len());
+        }
+        Ok(())
     } else {
-        load_fits(input)?
-    };
-
-    let scale_result = compute_scale(&img.data, scale_mode);
-    let histeq_lut = if scale_mode == ScaleMode::HistEq {
-        Some(build_histeq_lut(&img.data, scale_result.vmin, scale_result.vmax))
-    } else {
-        None
-    };
-
-    let rgba = render_to_rgba(
-        &img.data,
-        scale_result.vmin,
-        scale_result.vmax,
-        cmap,
-        scale_mode,
-        1.0,
-        0.5,
-        histeq_lut.as_deref(),
-    );
-
-    // Build image buffer at native resolution, then resize
-    let src = image::RgbaImage::from_raw(img.width as u32, img.height as u32, rgba)
-        .ok_or_else(|| anyhow::anyhow!("Failed to create image buffer"))?;
-
-    let resized = image::imageops::resize(
-        &src,
-        out_w,
-        out_h,
-        image::imageops::FilterType::Lanczos3,
-    );
-
-    resized.save(output)?;
-    println!("Saved {}x{} → {}", out_w, out_h, output.display());
-    Ok(())
+        let out = output.ok_or_else(|| anyhow::anyhow!("--output is required when not using --output-dir"))?;
+        render_one(input, out, out_w, out_h, scale_mode, cmap, hdu, vmin, vmax)
+    }
 }
 
 fn cmd_info(input: &Path, format: &str, hdu: Option<usize>) -> anyhow::Result<()> {
@@ -267,14 +333,85 @@ fn cmd_info(input: &Path, format: &str, hdu: Option<usize>) -> anyhow::Result<()
     Ok(())
 }
 
-fn cmd_stats(input: &Path, hdu: Option<usize>, format: &str) -> anyhow::Result<()> {
+fn parse_region(s: &str) -> anyhow::Result<(usize, usize, usize, usize)> {
+    // Format: "x1:x2,y1:y2"
+    let parts: Vec<&str> = s.split(',').collect();
+    anyhow::ensure!(parts.len() == 2, "Region must be x1:x2,y1:y2, got: {s}");
+    let xp: Vec<&str> = parts[0].split(':').collect();
+    let yp: Vec<&str> = parts[1].split(':').collect();
+    anyhow::ensure!(xp.len() == 2 && yp.len() == 2, "Region must be x1:x2,y1:y2");
+    let x1: usize = xp[0].trim().parse()?;
+    let x2: usize = xp[1].trim().parse()?;
+    let y1: usize = yp[0].trim().parse()?;
+    let y2: usize = yp[1].trim().parse()?;
+    Ok((x1, x2, y1, y2))
+}
+
+type CmpFn = fn(f64, f64) -> bool;
+
+fn evaluate_assert(expr: &str, header: &HashMap<String, String>) -> anyhow::Result<bool> {
+    // Try two-char operators first, then single-char
+    let ops: &[(&str, CmpFn)] = &[
+        ("==", |a, b| (a - b).abs() < 1e-9),
+        ("!=", |a, b| (a - b).abs() >= 1e-9),
+        ("<=", |a, b| a <= b),
+        (">=", |a, b| a >= b),
+        ("<",  |a, b| a < b),
+        (">",  |a, b| a > b),
+    ];
+    for &(op, cmp) in ops {
+        if let Some(pos) = expr.find(op) {
+            let lhs = expr[..pos].trim().to_ascii_uppercase();
+            let rhs = expr[pos + op.len()..].trim();
+            let val_str = header.get(&lhs).ok_or_else(|| anyhow::anyhow!("keyword '{lhs}' not in header"))?;
+            // Try numeric comparison
+            if let (Ok(a), Ok(b)) = (val_str.trim().parse::<f64>(), rhs.parse::<f64>()) {
+                return Ok(cmp(a, b));
+            }
+            // String comparison (only == and !=)
+            let rhs_clean = rhs.trim_matches('\'');
+            return Ok(match op {
+                "==" => val_str.trim() == rhs_clean,
+                "!=" => val_str.trim() != rhs_clean,
+                _ => anyhow::bail!("Cannot compare non-numeric values with '{op}'"),
+            });
+        }
+    }
+    anyhow::bail!("Could not parse assertion: {expr}")
+}
+
+fn cmd_stats(input: &Path, hdu: Option<usize>, format: &str, region: Option<&str>) -> anyhow::Result<()> {
     let img = if let Some(idx) = hdu {
         load_fits_hdu(input, idx)?
     } else {
         load_fits(input)?
     };
 
-    let stats = compute_stats(&img.data);
+    let data: &[f32] = if let Some(r) = region {
+        let (x1, x2, y1, y2) = parse_region(r)?;
+        let x2 = x2.min(img.width);
+        let y2 = y2.min(img.height);
+        // Collect region pixels (we'll use a temporary allocation)
+        let mut region_data = Vec::with_capacity((x2 - x1) * (y2 - y1));
+        for row in y1..y2 {
+            for col in x1..x2 {
+                if row < img.height && col < img.width {
+                    region_data.push(img.data[row * img.width + col]);
+                }
+            }
+        }
+        // stats borrows data, so we handle this inline
+        let stats = compute_stats(&region_data);
+        return print_stats(&stats, format);
+    } else {
+        &img.data
+    };
+
+    let stats = compute_stats(data);
+    print_stats(&stats, format)
+}
+
+fn print_stats(stats: &fitsview_core::stats::ImageStats, format: &str) -> anyhow::Result<()> {
 
     match format.to_ascii_lowercase().as_str() {
         "json" => {
@@ -326,6 +463,7 @@ fn cmd_check(
     min_height: Option<usize>,
     has_wcs: bool,
     has_keyword: &[String],
+    assert: &[String],
 ) -> anyhow::Result<()> {
     let img = load_fits(input)?;
     let mut failures: Vec<String> = Vec::new();
@@ -349,6 +487,13 @@ fn cmd_check(
             failures.push(format!("keyword {kw_upper} not found"));
         }
     }
+    for expr in assert {
+        match evaluate_assert(expr, &img.header) {
+            Ok(true) => {}
+            Ok(false) => failures.push(format!("assertion failed: {expr}")),
+            Err(e) => failures.push(format!("assertion error ({expr}): {e}")),
+        }
+    }
 
     if failures.is_empty() {
         println!("OK: {}", input.display());
@@ -361,7 +506,23 @@ fn cmd_check(
     }
 }
 
-fn run_gui(paths: Vec<PathBuf>) -> anyhow::Result<()> {
+fn run_gui(mut paths: Vec<PathBuf>, session: Option<PathBuf>) -> anyhow::Result<()> {
+    // Load session file and prepend its paths if provided
+    if let Some(ref session_path) = session {
+        use fitsview_core::session::Session;
+        match Session::load(session_path) {
+            Ok(s) => {
+                let mut session_paths: Vec<PathBuf> = s.files.iter()
+                    .map(|f| PathBuf::from(&f.path))
+                    .filter(|p| p.exists())
+                    .collect();
+                session_paths.extend(paths);
+                paths = session_paths;
+            }
+            Err(e) => log::warn!("Could not load session {}: {e}", session_path.display()),
+        }
+    }
+
     let mut files: Vec<PathBuf> = Vec::new();
     let mut dir: Option<PathBuf> = None;
 

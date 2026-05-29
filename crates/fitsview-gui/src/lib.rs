@@ -1,5 +1,10 @@
+pub mod annotation;
 pub mod app;
 pub mod command_palette;
+pub mod cube_panel;
+pub mod histogram_panel;
+pub mod plot_panel;
+pub mod wcs_overlay;
 pub mod dir_watcher;
 pub mod file_explorer;
 pub mod header_panel;

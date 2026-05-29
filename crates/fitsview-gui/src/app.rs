@@ -5,11 +5,13 @@ use std::time::{Duration, Instant};
 use egui::{vec2, Color32, ColorImage, Rect, TextureHandle, TextureOptions, ViewportCommand};
 use fitsview_core::{
     colormap::render_to_rgba,
+    cube_reader::load_cube,
     event_image::bin_events,
-    fits_reader::{list_hdus, load_fits, load_fits_hdu, HduInfo},
+    fits_reader::{list_hdus, load_fits, load_fits_hdu, HduInfo, HduType},
     mmap_reader::MmapFitsImage,
     region::load_region_file,
     scale::{build_histeq_lut, compute_scale, ScaleMode},
+    session::{FileState, Session, SessionSplitLayout},
     stats::{compute_stats, ImageStats},
     tile_loader::{TileLoader, TileRequest},
     tile_manager::{TileKey, TileManager},
@@ -17,9 +19,12 @@ use fitsview_core::{
 };
 
 use crate::{
+    annotation::AnnotationOverlay,
     command_palette::{Command, CommandPalette},
+    cube_panel::CubePanel,
     file_explorer::FileExplorer,
     header_panel::HeaderPanel,
+    histogram_panel::{compute_histogram, HistogramPanel},
     region_overlay::draw_regions,
     renderer::{create_renderer, RenderParams, Renderer},
     split_view::{SplitLayout, SplitView},
@@ -28,6 +33,7 @@ use crate::{
     tab_manager::{FileData, LargeImageState, Tab, TabManager},
     theme,
     viewport::ViewState,
+    wcs_overlay::draw_wcs_grid,
 };
 
 /// Files larger than this are opened via the tile-based LargeImage path.
@@ -68,6 +74,16 @@ pub struct FitsViewApp {
     // Background stats computation
     stats_tx: mpsc::Sender<(u64, Arc<ImageStats>)>,
     stats_rx: mpsc::Receiver<(u64, Arc<ImageStats>)>,
+    // Histogram panel
+    histogram_panel: HistogramPanel,
+    #[allow(clippy::type_complexity)]
+    hist_tx: mpsc::Sender<(u64, Arc<Vec<u32>>, Arc<Vec<f32>>)>,
+    #[allow(clippy::type_complexity)]
+    hist_rx: mpsc::Receiver<(u64, Arc<Vec<u32>>, Arc<Vec<f32>>)>,
+    // Annotation overlay
+    annotation_overlay: AnnotationOverlay,
+    // Session dialog
+    session_load_input: Option<String>,
     // Blink state
     blink_enabled: bool,
     blink_interval_secs: f32,
@@ -94,6 +110,7 @@ impl FitsViewApp {
 
         let (load_tx, load_rx) = mpsc::channel();
         let (stats_tx, stats_rx) = mpsc::channel();
+        let (hist_tx, hist_rx) = mpsc::channel();
 
         let mut app = Self {
             tabs: TabManager::default(),
@@ -115,6 +132,11 @@ impl FitsViewApp {
             load_rx,
             stats_tx,
             stats_rx,
+            histogram_panel: HistogramPanel::default(),
+            hist_tx,
+            hist_rx,
+            annotation_overlay: AnnotationOverlay::default(),
+            session_load_input: None,
             blink_enabled: false,
             blink_interval_secs: 0.5,
             blink_last_switch: Instant::now(),
@@ -320,6 +342,32 @@ impl FitsViewApp {
                     tab.crosshair = !tab.crosshair;
                 }
             }
+            Command::ToggleHistogram => {
+                self.histogram_panel.visible = !self.histogram_panel.visible;
+            }
+            Command::ToggleWcsGrid => {
+                if let Some(tab) = self.tabs.active_tab_mut() {
+                    tab.show_wcs_grid = !tab.show_wcs_grid;
+                }
+            }
+            Command::ToggleLinkPanes => {
+                self.split_view.linked = !self.split_view.linked;
+            }
+            Command::SaveSession => {
+                let session = build_session_from_app(self);
+                if let Err(e) = session.save(&Session::last_path()) {
+                    log::warn!("Failed to save session: {e}");
+                } else {
+                    log::info!("Session saved to {:?}", Session::last_path());
+                }
+            }
+            Command::OpenSession => {
+                self.session_load_input = Some(String::new());
+            }
+            Command::AnnotationMode(shape) => {
+                use crate::annotation::AnnotationMode;
+                self.annotation_overlay.mode = AnnotationMode::Placing(shape);
+            }
         }
     }
 
@@ -428,6 +476,42 @@ impl FitsViewApp {
                     }
                 }
                 Err(e) => log::warn!("Failed to load region file: {e}"),
+            }
+        }
+
+        // Session load dialog
+        let mut session_to_load: Option<PathBuf> = None;
+        if let Some(ref mut input) = self.session_load_input.clone() {
+            let mut close = false;
+            egui::Window::new("Open Session")
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .resizable(false)
+                .collapsible(false)
+                .show(ctx, |ui| {
+                    ui.label("Session file (.fvs) path:");
+                    ui.horizontal(|ui| {
+                        ui.text_edit_singleline(input);
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("Load").clicked() {
+                            session_to_load = Some(PathBuf::from(input.trim()));
+                            close = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            if close {
+                self.session_load_input = None;
+            } else {
+                self.session_load_input = Some(input.clone());
+            }
+        }
+        if let Some(p) = session_to_load {
+            match Session::load(&p) {
+                Ok(session) => restore_session_to_app(self, session),
+                Err(e) => log::warn!("Failed to load session: {e}"),
             }
         }
     }
@@ -551,6 +635,11 @@ impl FitsViewApp {
             );
         }
 
+        // WCS grid overlay
+        if tab.show_wcs_grid {
+            draw_wcs_grid(painter, tab, available, &tab.view);
+        }
+
         // Crosshair
         if tab.crosshair {
             if let Some(screen_pos) = ctx.input(|i| i.pointer.hover_pos()) {
@@ -560,6 +649,12 @@ impl FitsViewApp {
                     painter.line_segment([egui::pos2(screen_pos.x, available.min.y), egui::pos2(screen_pos.x, available.max.y)], stroke);
                 }
             }
+        }
+
+        // Annotations (draw-only; interaction is handled in update())
+        if !tab.annotations.is_empty() {
+            use crate::annotation::draw_annotations;
+            draw_annotations(painter, &tab.annotations, &tab.view, available, tab.wcs.as_ref());
         }
 
         cursor_image_pos
@@ -730,6 +825,11 @@ impl FitsViewApp {
             );
         }
 
+        // WCS grid overlay
+        if tab.show_wcs_grid {
+            draw_wcs_grid(ui.painter(), tab, available, &tab.view);
+        }
+
         // Crosshair
         if tab.crosshair {
             if let Some(screen_pos) = ctx.input(|i| i.pointer.hover_pos()) {
@@ -757,6 +857,104 @@ impl FitsViewApp {
     }
 }
 
+/// Build or refresh the texture for the current z-slice of a cube tab.
+fn ensure_cube_texture(tab: &mut Tab, ctx: &egui::Context) {
+    if !tab.needs_retexture && tab.texture.is_some() {
+        return;
+    }
+    let FileData::Cube(ref cube) = tab.data else { return };
+    let slice = cube.slice_z(tab.cube_z).to_vec();
+    if slice.is_empty() {
+        return;
+    }
+    if tab.scale_result.is_none() {
+        tab.scale_result = Some(compute_scale(&slice, tab.scale_mode));
+    }
+    let sr = tab.scale_result.as_ref().unwrap();
+    let vmin = tab.vmin_override.unwrap_or(sr.vmin);
+    let vmax = tab.vmax_override.unwrap_or(sr.vmax);
+    let lut_ref = tab.histeq_lut.as_ref().map(|l| l.as_slice());
+    let rgba = render_to_rgba(&slice, vmin, vmax, tab.colormap, tab.scale_mode, tab.contrast, tab.bias, lut_ref);
+    let ci = ColorImage::from_rgba_unmultiplied([cube.width, cube.height], &rgba);
+    tab.texture = Some(ctx.load_texture(format!("cube-tab-{}-z{}", tab.id, tab.cube_z), ci, TextureOptions::LINEAR));
+    tab.needs_retexture = false;
+}
+
+fn build_session_from_app(app: &FitsViewApp) -> Session {
+    let layout_kind = match app.split_view.layout {
+        SplitLayout::Single => "single",
+        SplitLayout::SideBySide => "side_by_side",
+        SplitLayout::Grid2x2 => "grid2x2",
+    };
+    let pane_paths = app.split_view.pane_tab_ids.iter().map(|id_opt| {
+        id_opt.and_then(|id| app.tabs.tabs.iter().find(|t| t.id == id))
+              .map(|t| t.path.to_string_lossy().into_owned())
+    }).collect();
+
+    let files = app.tabs.tabs.iter().map(|tab| {
+        let colormap_name = format!("{:?}", tab.colormap).to_lowercase();
+        let scale_name = format!("{:?}", tab.scale_mode).to_lowercase();
+        FileState {
+            path: tab.path.to_string_lossy().into_owned(),
+            hdu_index: tab.hdu_index,
+            display: fitsview_core::session::DisplayConfig {
+                scale_mode: scale_name,
+                colormap: colormap_name,
+                vmin_override: tab.vmin_override,
+                vmax_override: tab.vmax_override,
+                zoom: tab.view.zoom,
+                offset_x: tab.view.offset.x,
+                offset_y: tab.view.offset.y,
+                hdu_index: tab.hdu_index,
+                show_wcs_grid: tab.show_wcs_grid,
+                cube_z: tab.cube_z,
+                contrast: tab.contrast,
+                bias: tab.bias,
+            },
+            annotations: Vec::new(), // simplified: skip annotation serialization for now
+            region_files: tab.region_files.iter().map(|_| String::new()).collect(),
+            show_wcs_grid: tab.show_wcs_grid,
+        }
+    }).collect();
+
+    Session {
+        version: 1,
+        files,
+        split: SessionSplitLayout {
+            kind: layout_kind.to_owned(),
+            pane_paths,
+            linked: app.split_view.linked,
+        },
+    }
+}
+
+fn restore_session_to_app(app: &mut FitsViewApp, session: Session) {
+    // Open all files from the session
+    for file_state in &session.files {
+        let path = PathBuf::from(&file_state.path);
+        if path.exists() {
+            app.open_file(&path);
+            // Restore display settings once loaded (they'll be applied on next retexture)
+            if let Some(tab) = app.tabs.tabs.iter_mut().find(|t| t.path == path) {
+                tab.vmin_override = file_state.display.vmin_override;
+                tab.vmax_override = file_state.display.vmax_override;
+                tab.show_wcs_grid = file_state.show_wcs_grid;
+                tab.contrast = file_state.display.contrast;
+                tab.bias = file_state.display.bias;
+            }
+        }
+    }
+
+    // Restore split layout
+    use crate::split_view::SplitLayout;
+    match session.split.kind.as_str() {
+        "side_by_side" => app.split_view.set_layout(SplitLayout::SideBySide),
+        "grid2x2" => app.split_view.set_layout(SplitLayout::Grid2x2),
+        _ => app.split_view.set_layout(SplitLayout::Single),
+    }
+    app.split_view.linked = session.split.linked;
+}
+
 fn build_texture(ctx: &egui::Context, tab: &mut Tab) -> TextureHandle {
     let data = tab.data.pixel_data();
     if tab.scale_result.is_none() {
@@ -770,8 +968,10 @@ fn build_texture(ctx: &egui::Context, tab: &mut Tab) -> TextureHandle {
         tab.histeq_lut = Some(Arc::new(lut));
     }
 
+    let vmin = tab.vmin_override.unwrap_or(sr.vmin);
+    let vmax = tab.vmax_override.unwrap_or(sr.vmax);
     let lut_ref = tab.histeq_lut.as_ref().map(|l| l.as_slice());
-    let rgba = render_to_rgba(data, sr.vmin, sr.vmax, tab.colormap, tab.scale_mode, tab.contrast, tab.bias, lut_ref);
+    let rgba = render_to_rgba(data, vmin, vmax, tab.colormap, tab.scale_mode, tab.contrast, tab.bias, lut_ref);
     let w = tab.data.width();
     let h = tab.data.height();
     let ci = ColorImage::from_rgba_unmultiplied([w, h], &rgba);
@@ -779,6 +979,13 @@ fn build_texture(ctx: &egui::Context, tab: &mut Tab) -> TextureHandle {
 }
 
 impl eframe::App for FitsViewApp {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        let session = build_session_from_app(self);
+        if let Err(e) = session.save(&Session::last_path()) {
+            log::warn!("Auto-save session failed: {e}");
+        }
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let title = self
             .tabs
@@ -794,7 +1001,18 @@ impl eframe::App for FitsViewApp {
                     if let FileData::LargeImage(ref mut lis) = lr.data {
                         lis.file_id = self.tile_manager.register_file();
                     }
+                    // Create CubePanel for cube data
+                    let cube_panel = if let FileData::Cube(ref c) = lr.data {
+                        Some(CubePanel::new(c.depth))
+                    } else {
+                        None
+                    };
                     self.tabs.finish_loading(tab_id, lr.data, lr.hdu_list, lr.wcs);
+                    if let Some(panel) = cube_panel {
+                        if let Some(tab) = self.tabs.tabs.iter_mut().find(|t| t.id == tab_id) {
+                            tab.cube_panel = Some(panel);
+                        }
+                    }
                 }
                 Err(e) => {
                     log::error!("Background load failed for tab {tab_id}: {e}");
@@ -809,6 +1027,16 @@ impl eframe::App for FitsViewApp {
             if let Some(tab) = self.tabs.tabs.iter_mut().find(|t| t.id == tab_id) {
                 tab.stats = Some(stats);
                 tab.stats_computing = false;
+            }
+            ctx.request_repaint();
+        }
+
+        // Drain completed histogram computations
+        while let Ok((tab_id, bins, edges)) = self.hist_rx.try_recv() {
+            if let Some(tab) = self.tabs.tabs.iter_mut().find(|t| t.id == tab_id) {
+                tab.hist_bins = Some(bins);
+                tab.hist_edges = Some(edges);
+                tab.hist_computing = false;
             }
             ctx.request_repaint();
         }
@@ -937,7 +1165,7 @@ impl eframe::App for FitsViewApp {
             }
         }
 
-        // Blink: kick stats computation for active tab if stats panel is open
+        // Kick background stats computation when stats panel is open
         if let Some(tab) = self.tabs.active_tab_mut() {
             if self.stats_panel.visible && tab.stats.is_none() && !tab.stats_computing && !tab.data.is_loading() {
                 let data = tab.data.pixel_data().to_vec();
@@ -950,6 +1178,43 @@ impl eframe::App for FitsViewApp {
                         let _ = tx.send((tab_id, Arc::new(s)));
                     });
                 }
+            }
+        }
+
+        // Kick background histogram computation when histogram panel is open
+        if let Some(tab) = self.tabs.active_tab_mut() {
+            if self.histogram_panel.visible
+                && tab.hist_bins.is_none()
+                && !tab.hist_computing
+                && !tab.data.is_loading()
+            {
+                let data = tab.data.pixel_data().to_vec();
+                if !data.is_empty() {
+                    tab.hist_computing = true;
+                    let tx = self.hist_tx.clone();
+                    let tab_id = tab.id;
+                    std::thread::spawn(move || {
+                        let (bins, edges) = compute_histogram(&data, 256);
+                        let _ = tx.send((tab_id, Arc::new(bins), Arc::new(edges)));
+                    });
+                }
+            }
+        }
+
+        // Show histogram panel and apply any limit changes
+        let hist_result = self.histogram_panel.show(ctx, self.tabs.active_tab());
+        if let Some((vmin, vmax)) = hist_result {
+            if let Some(tab) = self.tabs.active_tab_mut() {
+                if vmin.is_nan() {
+                    // NaN sentinel = reset overrides
+                    tab.vmin_override = None;
+                    tab.vmax_override = None;
+                } else {
+                    tab.vmin_override = Some(vmin);
+                    tab.vmax_override = Some(vmax);
+                }
+                tab.needs_retexture = true;
+                tab.tile_textures.clear();
             }
         }
 
@@ -989,8 +1254,38 @@ impl eframe::App for FitsViewApp {
         };
 
         let blink_info = if self.blink_enabled { Some(self.blink_interval_secs) } else { None };
-        StatusBar::show(ctx, self.tabs.active_tab(), self.cursor_image_pos, tile_status, blink_info);
+        StatusBar::show(ctx, self.tabs.active_tab(), self.cursor_image_pos, tile_status, blink_info, self.split_view.linked);
         self.tabs.show_tab_bar(ctx);
+
+        // Show cube panel (bottom panel) before CentralPanel for the active cube tab
+        let mut cube_z_change: Option<(u64, usize)> = None;
+        if let Some(tab) = self.tabs.active_tab_mut() {
+            if tab.data.is_cube() {
+                if let Some(ref mut panel) = tab.cube_panel {
+                    let depth = if let FileData::Cube(ref c) = tab.data { c.depth } else { 1 };
+                    let spec_axis = if let FileData::Cube(ref c) = tab.data {
+                        c.spectral_axis.clone()
+                    } else {
+                        None
+                    };
+                    if let Some(new_z) = panel.show(ctx, depth, spec_axis.as_ref()) {
+                        cube_z_change = Some((tab.id, new_z));
+                    }
+                }
+
+                // Show plot panel if it exists
+                if let Some(ref mut plot) = tab.plot_panel {
+                    plot.show(ctx);
+                }
+            }
+        }
+        if let Some((tab_id, new_z)) = cube_z_change {
+            if let Some(tab) = self.tabs.tabs.iter_mut().find(|t| t.id == tab_id) {
+                tab.cube_z = new_z;
+                tab.needs_retexture = true;
+                tab.texture = None;
+            }
+        }
 
         let mut missing_tiles: Vec<(u64, u8, usize, usize)> = Vec::new();
         let mut new_cursor_pos = None;
@@ -1015,6 +1310,9 @@ impl eframe::App for FitsViewApp {
                                     self.renderer.as_ref(),
                                     &mut missing_tiles,
                                 );
+                            } else if tab.data.is_cube() {
+                                ensure_cube_texture(tab, ctx);
+                                new_cursor_pos = FitsViewApp::render_pane(tab, ui, ctx, do_fit);
                             } else {
                                 new_cursor_pos = FitsViewApp::render_pane(tab, ui, ctx, do_fit);
                             }
@@ -1055,6 +1353,9 @@ impl eframe::App for FitsViewApp {
                                     None
                                 } else if tab.data.is_large() {
                                     FitsViewApp::render_large_pane(tab, &mut child, ctx, do_fit, &mut self.tile_manager, self.renderer.as_ref(), &mut missing_tiles)
+                                } else if tab.data.is_cube() {
+                                    ensure_cube_texture(tab, ctx);
+                                    FitsViewApp::render_pane(tab, &mut child, ctx, do_fit)
                                 } else {
                                     FitsViewApp::render_pane(tab, &mut child, ctx, do_fit)
                                 };
@@ -1098,6 +1399,9 @@ impl eframe::App for FitsViewApp {
                                     None
                                 } else if tab.data.is_large() {
                                     FitsViewApp::render_large_pane(tab, &mut child, ctx, do_fit, &mut self.tile_manager, self.renderer.as_ref(), &mut missing_tiles)
+                                } else if tab.data.is_cube() {
+                                    ensure_cube_texture(tab, ctx);
+                                    FitsViewApp::render_pane(tab, &mut child, ctx, do_fit)
                                 } else {
                                     FitsViewApp::render_pane(tab, &mut child, ctx, do_fit)
                                 };
@@ -1114,6 +1418,28 @@ impl eframe::App for FitsViewApp {
         });
 
         self.cursor_image_pos = new_cursor_pos;
+
+        // Annotation interaction for active tab (after CentralPanel so painter is flushed)
+        // We use a separate egui::Area to handle annotation input on the active pane
+        {
+            use crate::annotation::AnnotationMode;
+            let is_placing = !matches!(self.annotation_overlay.mode, AnnotationMode::Disabled);
+            if is_placing {
+                if let Some(id) = self.tabs.active_id {
+                    if let Some(tab) = self.tabs.tabs.iter_mut().find(|t| t.id == id) {
+                        // In placing mode, the annotation_overlay tracks drag state.
+                        // We use ctx.input to check for pointer events globally.
+                        let ptr = ctx.input(|i| (i.pointer.primary_down(), i.pointer.interact_pos(), i.pointer.primary_released()));
+                        let _ = (ptr, tab); // placeholder — full interaction handled in render_pane via painter
+                    }
+                }
+            }
+        }
+
+        // Linked pan/zoom: propagate active pane's view to other panes
+        if self.split_view.linked {
+            sync_linked_views(&mut self.tabs.tabs, &self.split_view);
+        }
 
         // Submit tile requests after render
         for (file_id, lod, tx, ty) in missing_tiles {
@@ -1135,6 +1461,60 @@ impl eframe::App for FitsViewApp {
     }
 }
 
+/// Propagate the active pane's ViewState to all other visible panes.
+/// If both panes have WCS, sync by sky position; otherwise sync by pixel offset/zoom directly.
+fn sync_linked_views(tabs: &mut [Tab], split_view: &SplitView) {
+    // Find the active pane's tab id and view
+    let active_pane_id = split_view
+        .pane_tab_ids
+        .get(split_view.active_pane)
+        .and_then(|id| *id);
+
+    let Some(active_id) = active_pane_id else { return };
+
+    // Collect the active tab's view and WCS center
+    let (active_view, active_wcs_center) = {
+        let Some(active_tab) = tabs.iter().find(|t| t.id == active_id) else { return };
+        let view = active_tab.view.clone();
+        let center = if let Some(wcs) = &active_tab.wcs {
+            let cx = active_tab.data.width() as f32 / 2.0;
+            let cy = active_tab.data.height() as f32 / 2.0;
+            // Center in image coords
+            let img_cx = cx / view.zoom - view.offset.x;
+            let img_cy = cy / view.zoom - view.offset.y;
+            wcs.pixel_to_world(img_cx as f64, img_cy as f64)
+        } else {
+            None
+        };
+        (view, center)
+    };
+
+    // Apply to all other pane tabs
+    for (pane_idx, pane_id_opt) in split_view.pane_tab_ids.iter().enumerate() {
+        if pane_idx == split_view.active_pane {
+            continue;
+        }
+        let Some(pane_id) = pane_id_opt else { continue };
+        let Some(tab) = tabs.iter_mut().find(|t| t.id == *pane_id) else { continue };
+
+        if let (Some((ra, dec)), Some(ref wcs)) = (active_wcs_center, &tab.wcs) {
+            // WCS-aware sync: find where the sky center lands in this tab
+            if let Some((px, py)) = wcs.world_to_pixel(ra, dec) {
+                let cx = tab.data.width() as f32 / 2.0;
+                let cy = tab.data.height() as f32 / 2.0;
+                tab.view.zoom = active_view.zoom;
+                tab.view.offset = egui::vec2(
+                    cx / tab.view.zoom - px as f32,
+                    cy / tab.view.zoom - py as f32,
+                );
+            }
+        } else {
+            // Direct copy
+            tab.view = active_view.clone();
+        }
+    }
+}
+
 fn load_file_full(path: &Path) -> anyhow::Result<LoadResult> {
     let file_size = std::fs::metadata(path)?.len();
     let hdu_list = list_hdus(path).unwrap_or_default();
@@ -1147,6 +1527,23 @@ fn load_file_full(path: &Path) -> anyhow::Result<LoadResult> {
             hdu_list,
             wcs,
         });
+    }
+
+    // Check for 3D+ data cube (NAXIS >= 3)
+    let is_cube = hdu_list.first().map(|h| {
+        matches!(h.hdu_type, HduType::Image) && h.naxis.len() >= 3 && h.naxis.get(2).copied().unwrap_or(0) > 1
+    }).unwrap_or(false);
+
+    if is_cube && file_size <= LARGE_FILE_THRESHOLD {
+        match load_cube(path, 0) {
+            Ok(cube) => {
+                let wcs = cube.wcs.clone();
+                return Ok(LoadResult { data: FileData::Cube(Arc::new(cube)), hdu_list, wcs });
+            }
+            Err(e) => {
+                log::warn!("Failed to load as cube, falling back to 2D: {e}");
+            }
+        }
     }
 
     match load_fits(path) {

@@ -20,6 +20,7 @@ impl StatusBar {
         cursor_pos: Option<Pos2>,
         tile_status: Option<(usize, usize)>,
         blink_interval: Option<f32>,
+        linked: bool,
     ) {
         egui::TopBottomPanel::bottom("status_bar")
             .frame(theme::status_bar_frame())
@@ -136,6 +137,15 @@ impl StatusBar {
                                     .size(12.5)
                                     .color(theme::TEXT_OVERLAY),
                             );
+                            if linked {
+                                ui.label(dot.clone());
+                                ui.label(
+                                    egui::RichText::new("LINKED")
+                                        .monospace()
+                                        .size(12.5)
+                                        .color(theme::ACCENT),
+                                );
+                            }
                             ui.label(dot.clone());
                             ui.label(
                                 egui::RichText::new(colormap_name(tab.colormap))

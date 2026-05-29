@@ -1,4 +1,5 @@
 pub mod colormap;
+pub mod cube_reader;
 pub mod compressed_fits;
 pub mod event_image;
 pub mod fits_reader;
@@ -8,4 +9,6 @@ pub mod scale;
 pub mod stats;
 pub mod tile_loader;
 pub mod tile_manager;
+pub mod session;
 pub mod wcs;
+pub mod wcs_grid;
