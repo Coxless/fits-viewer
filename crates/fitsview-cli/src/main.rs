@@ -7,7 +7,9 @@ use eframe::egui;
 use rayon::prelude::*;
 
 use fitsview_core::{
+    arithmetic::{image_arithmetic, ArithOp},
     colormap::{render_to_rgba, Colormap},
+    composite::{render_rgb_to_rgba, RgbChannel, RgbCompositeData},
     fits_reader::{list_hdus, load_fits, load_fits_hdu},
     scale::{build_histeq_lut, compute_scale, ScaleMode},
     stats::compute_stats,
@@ -31,11 +33,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Render a FITS image to PNG or JPEG
+    /// Render a FITS image to PNG, JPEG, or PDF
     Render {
         /// Input FITS file (or directory when --output-dir is given)
         input: PathBuf,
-        /// Output image file (.png or .jpg); omit when using --output-dir
+        /// Output image file (.png, .jpg, .pdf); omit when using --output-dir
         #[arg(short, long)]
         output: Option<PathBuf>,
         /// Output directory for batch rendering (renders all image HDUs)
@@ -62,6 +64,37 @@ enum Commands {
         /// Number of parallel render jobs for batch mode
         #[arg(long, default_value = "4")]
         jobs: usize,
+        /// Output format: png|jpeg|pdf|svg (auto-detected from extension if omitted)
+        #[arg(long)]
+        format: Option<String>,
+        /// DPI for PDF output (default: 150)
+        #[arg(long, default_value = "150")]
+        dpi: u32,
+        /// Add a colorbar to PDF output
+        #[arg(long)]
+        colorbar: bool,
+        /// Title for PDF output
+        #[arg(long)]
+        title: Option<String>,
+        /// RGB composite: provide exactly 3 FITS files (R G B channels)
+        #[arg(long, num_args = 3, value_names = ["R_FITS", "G_FITS", "B_FITS"])]
+        rgb: Option<Vec<PathBuf>>,
+    },
+    /// Pixel-wise arithmetic between two FITS images
+    Arithmetic {
+        /// First input FITS file (A)
+        a: PathBuf,
+        /// Second input FITS file (B)
+        b: PathBuf,
+        /// Output FITS-like file (.fits or .png)
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Operation: add|sub|mul|div|reldiff
+        #[arg(long, default_value = "sub")]
+        op: String,
+        /// Scale factor applied to result
+        #[arg(long, default_value = "1.0")]
+        scale: f32,
     },
     /// Print FITS header information
     Info {
@@ -122,15 +155,30 @@ fn main() -> anyhow::Result<()> {
 
 fn run_headless(cmd: Commands) -> anyhow::Result<()> {
     match cmd {
-        Commands::Render { input, output, output_dir, size, scale, colormap, hdu, vmin, vmax, jobs } => {
-            cmd_render(&input, output.as_deref(), output_dir.as_deref(), &size, &scale, &colormap, hdu, vmin, vmax, jobs)
+        Commands::Render { input, output, output_dir, size, scale, colormap, hdu, vmin, vmax, jobs, format, dpi, colorbar, title, rgb } => {
+            cmd_render(&input, output.as_deref(), output_dir.as_deref(), &size, &scale, &colormap, hdu, vmin, vmax, jobs, format.as_deref(), dpi, colorbar, title.as_deref(), rgb.as_deref())
         }
+        Commands::Arithmetic { a, b, output, op, scale } => cmd_arithmetic(&a, &b, &output, &op, scale),
         Commands::Info { input, format, hdu } => cmd_info(&input, &format, hdu),
         Commands::Stats { input, hdu, format, region } => cmd_stats(&input, hdu, &format, region.as_deref()),
         Commands::Check { input, min_width, min_height, has_wcs, has_keyword, assert } => {
             cmd_check(&input, min_width, min_height, has_wcs, &has_keyword, &assert)
         }
     }
+}
+
+/// Write raw RGBA pixel data as a PNG file using the `image` crate's save API.
+fn write_rgba_png(rgba: &[u8], width: usize, height: usize, path: &Path) -> anyhow::Result<()> {
+    // Encode PNG manually via the `png` encoder embedded in the image crate
+    let file = std::fs::File::create(path)?;
+    let w = &mut std::io::BufWriter::new(file);
+    let mut encoder = png::Encoder::new(w, width as u32, height as u32);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header()?;
+    writer.write_image_data(rgba)?;
+    println!("Saved {}×{} → {}", width, height, path.display());
+    Ok(())
 }
 
 fn parse_scale(s: &str) -> anyhow::Result<ScaleMode> {
@@ -214,13 +262,29 @@ fn cmd_render(
     vmin: Option<f32>,
     vmax: Option<f32>,
     jobs: usize,
+    format: Option<&str>,
+    dpi: u32,
+    colorbar: bool,
+    title: Option<&str>,
+    rgb: Option<&[PathBuf]>,
 ) -> anyhow::Result<()> {
+    // RGB composite mode
+    if let Some(channels) = rgb {
+        anyhow::ensure!(channels.len() == 3, "RGB requires exactly 3 input files");
+        let out = output.ok_or_else(|| anyhow::anyhow!("--output is required for RGB mode"))?;
+        return cmd_render_rgb(&channels[0], &channels[1], &channels[2], out, parse_scale(scale)?);
+    }
+
     let scale_mode = parse_scale(scale)?;
     let cmap = parse_colormap(colormap)?;
     let (out_w, out_h) = parse_size(size)?;
 
+    // Determine output format from argument or extension
+    let fmt = format.map(str::to_ascii_lowercase);
+    let output_format = fmt.as_deref();
+
     if let Some(out_dir) = output_dir {
-        // Batch mode: collect all FITS files from input (file or directory)
+        // Batch mode
         std::fs::create_dir_all(out_dir)?;
         let files: Vec<PathBuf> = if input.is_dir() {
             let mut v = Vec::new();
@@ -256,8 +320,166 @@ fn cmd_render(
         Ok(())
     } else {
         let out = output.ok_or_else(|| anyhow::anyhow!("--output is required when not using --output-dir"))?;
-        render_one(input, out, out_w, out_h, scale_mode, cmap, hdu, vmin, vmax)
+
+        let ext = out.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+        let use_pdf = output_format == Some("pdf") || ext == "pdf";
+
+        if use_pdf {
+            render_pdf(input, out, out_w, out_h, scale_mode, cmap, hdu, vmin, vmax, dpi, colorbar, title)
+        } else {
+            render_one(input, out, out_w, out_h, scale_mode, cmap, hdu, vmin, vmax)
+        }
     }
+}
+
+fn cmd_render_rgb(r_path: &Path, g_path: &Path, b_path: &Path, output: &Path, scale: ScaleMode) -> anyhow::Result<()> {
+    let r = load_fits(r_path)?;
+    let g = load_fits(g_path)?;
+    let b = load_fits(b_path)?;
+
+    let w = r.width.min(g.width).min(b.width);
+    let h = r.height.min(g.height).min(b.height);
+
+    let make_channel = |img: &fitsview_core::fits_reader::FitsImage| -> RgbChannel {
+        let sr = compute_scale(&img.data, scale);
+        RgbChannel { data: img.data.clone(), vmin: sr.vmin, vmax: sr.vmax, scale, contrast: 1.0, bias: 0.5 }
+    };
+
+    let composite = RgbCompositeData { r: make_channel(&r), g: make_channel(&g), b: make_channel(&b), width: w, height: h };
+    let rgba = render_rgb_to_rgba(&composite);
+
+    // Write as PNG directly without using image crate's higher-level types
+    write_rgba_png(&rgba, w, h, output)?;
+    println!("RGB composite saved → {}", output.display());
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_pdf(
+    input: &Path,
+    output: &Path,
+    out_w: u32,
+    out_h: u32,
+    scale_mode: ScaleMode,
+    cmap: Colormap,
+    hdu: Option<usize>,
+    vmin: Option<f32>,
+    vmax: Option<f32>,
+    dpi: u32,
+    colorbar: bool,
+    title: Option<&str>,
+) -> anyhow::Result<()> {
+    use printpdf::*;
+
+    let img_data = if let Some(idx) = hdu { load_fits_hdu(input, idx)? } else { load_fits(input)? };
+
+    let (use_vmin, use_vmax) = if let (Some(mn), Some(mx)) = (vmin, vmax) {
+        (mn, mx)
+    } else {
+        let sr = compute_scale(&img_data.data, scale_mode);
+        (sr.vmin, sr.vmax)
+    };
+
+    let histeq_lut = if scale_mode == ScaleMode::HistEq {
+        Some(build_histeq_lut(&img_data.data, use_vmin, use_vmax))
+    } else {
+        None
+    };
+
+    let rgba = render_to_rgba(&img_data.data, use_vmin, use_vmax, cmap, scale_mode, 1.0, 0.5, histeq_lut.as_deref());
+
+    // Convert RGBA → RGB by dropping alpha channel; use original image dimensions
+    let px_w = img_data.width as u32;
+    let px_h = img_data.height as u32;
+    let rgb_img: Vec<u8> = rgba.chunks(4).flat_map(|px| [px[0], px[1], px[2]]).collect();
+
+    // Create PDF
+    let dpi_f = dpi as f32;
+    let page_w_mm = (out_w as f32 / dpi_f) * 25.4;
+    let page_h_mm = (out_h as f32 / dpi_f) * 25.4 + if title.is_some() { 12.0 } else { 0.0 } + if colorbar { 12.0 } else { 0.0 };
+
+    let (doc, page1, layer1) = PdfDocument::new(
+        title.unwrap_or("fits-view"),
+        Mm(page_w_mm),
+        Mm(page_h_mm),
+        "Layer 1",
+    );
+
+    let current_layer = doc.get_page(page1).get_layer(layer1);
+
+    // Image y offset if title present
+    let img_y_offset = if colorbar { 12.0f32 } else { 0.0 };
+
+    // Embed the rasterized image
+    let pdf_img = Image::from(ImageXObject {
+        width: Px(px_w as usize),
+        height: Px(px_h as usize),
+        color_space: ColorSpace::Rgb,
+        bits_per_component: ColorBits::Bit8,
+        interpolate: true,
+        image_data: rgb_img,
+        image_filter: None,
+        smask: None,
+        clipping_bbox: None,
+    });
+
+    pdf_img.add_to_layer(
+        current_layer.clone(),
+        ImageTransform {
+            translate_x: Some(Mm(0.0)),
+            translate_y: Some(Mm(img_y_offset)),
+            scale_x: Some(page_w_mm / (px_w as f32 / dpi_f * 25.4)),
+            scale_y: Some((page_h_mm - img_y_offset - if title.is_some() { 12.0 } else { 0.0 }) / (px_h as f32 / dpi_f * 25.4)),
+            ..Default::default()
+        },
+    );
+
+    // Title text
+    if let Some(t) = title {
+        let font = doc.add_builtin_font(BuiltinFont::Helvetica)?;
+        current_layer.use_text(t, 12.0, Mm(2.0), Mm(page_h_mm - 10.0), &font);
+    }
+
+    // Simple colorbar: gradient text labels at bottom
+    if colorbar {
+        let font = doc.add_builtin_font(BuiltinFont::Helvetica)?;
+        current_layer.use_text(format!("{use_vmin:.3}"), 7.0, Mm(1.0), Mm(2.0), &font);
+        current_layer.use_text(format!("{use_vmax:.3}"), 7.0, Mm(page_w_mm - 18.0), Mm(2.0), &font);
+        current_layer.use_text("Color range", 7.0, Mm(page_w_mm / 2.0 - 8.0), Mm(2.0), &font);
+    }
+
+    doc.save(&mut std::io::BufWriter::new(std::fs::File::create(output)?))?;
+    println!("PDF saved ({dpi} DPI) → {}", output.display());
+    Ok(())
+}
+
+fn cmd_arithmetic(a: &Path, b: &Path, output: &Path, op_str: &str, scale: f32) -> anyhow::Result<()> {
+    let img_a = load_fits(a)?;
+    let img_b = load_fits(b)?;
+
+    anyhow::ensure!(
+        img_a.width == img_b.width && img_a.height == img_b.height,
+        "Image size mismatch: {:?}={}×{} vs {:?}={}×{}",
+        a, img_a.width, img_a.height, b, img_b.width, img_b.height
+    );
+
+    let op = match op_str.to_ascii_lowercase().as_str() {
+        "add" | "+" => ArithOp::Add,
+        "sub" | "-" => ArithOp::Sub,
+        "mul" | "*" => ArithOp::Mul,
+        "div" | "/" => ArithOp::Div,
+        "reldiff" => ArithOp::RelDiff,
+        other => anyhow::bail!("Unknown operation: {other}. Use add|sub|mul|div|reldiff"),
+    };
+
+    let result = image_arithmetic(&img_a.data, &img_b.data, img_a.width, img_a.height, op, scale)?;
+
+    // Save as PNG for now (could add FITS write support later)
+    let sr = compute_scale(&result, ScaleMode::ZScale);
+    let rgba = render_to_rgba(&result, sr.vmin, sr.vmax, Colormap::Gray, ScaleMode::ZScale, 1.0, 0.5, None);
+    write_rgba_png(&rgba, img_a.width, img_a.height, output)?;
+    println!("Arithmetic result ({op_str}) saved → {}", output.display());
+    Ok(())
 }
 
 fn cmd_info(input: &Path, format: &str, hdu: Option<usize>) -> anyhow::Result<()> {

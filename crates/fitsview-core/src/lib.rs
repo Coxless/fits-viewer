@@ -1,9 +1,15 @@
+pub mod arithmetic;
+pub mod catalog;
 pub mod colormap;
+pub mod composite;
+pub mod contour;
 pub mod cube_reader;
 pub mod compressed_fits;
 pub mod event_image;
 pub mod fits_reader;
 pub mod mmap_reader;
+pub mod photometry;
+pub mod profile;
 pub mod region;
 pub mod scale;
 pub mod stats;

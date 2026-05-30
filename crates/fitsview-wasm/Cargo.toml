@@ -1,0 +1,27 @@
+[package]
+name = "fitsview-wasm"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+fitsview-core = { path = "../fitsview-core" }
+fitsview-gui = { path = "../fitsview-gui", default-features = false }
+eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow"] }
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = [
+    "XmlHttpRequest",
+    "XmlHttpRequestResponseType",
+    "Window",
+    "Document",
+    "HtmlCanvasElement",
+] }
+js-sys = "0.3"
+console_error_panic_hook = "0.1"
+log = { workspace = true }
+anyhow = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen-futures = "0.4"

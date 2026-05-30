@@ -3,6 +3,10 @@ members = [
     "crates/fitsview-core",
     "crates/fitsview-gui",
     "crates/fitsview-cli",
+    # fitsview-wasm: build with `trunk build` from crates/fitsview-wasm/
+    # (excluded from default workspace; target = wasm32)
+    # fitsview-py: build with `maturin develop` from crates/fitsview-py/
+    # (excluded from default workspace; requires Python environment)
 ]
 resolver = "2"
 
