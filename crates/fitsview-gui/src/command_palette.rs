@@ -23,6 +23,22 @@ pub enum Command {
     SaveSession,
     OpenSession,
     AnnotationMode(ShapeType),
+    // ── Step 8 ──
+    RgbComposite,
+    AddContourOverlay,
+    QuerySimbad,
+    QueryVizier,
+    QueryGaiaDr3,
+    LoadLocalVotable,
+    // ── Step 9 ──
+    LineProfileTool,
+    PhotometryMode,
+    ImageArithmetic,
+    LoadMask,
+    // ── Step 10 ──
+    SampConnect,
+    SampDisconnect,
+    ToggleScriptConsole,
 }
 
 impl Command {
@@ -62,6 +78,19 @@ impl Command {
             Command::AnnotationMode(ShapeType::Box)    => "Annotate: Draw Box",
             Command::AnnotationMode(ShapeType::Line)   => "Annotate: Draw Line",
             Command::AnnotationMode(ShapeType::Text)   => "Annotate: Place Text",
+            Command::RgbComposite       => "RGB Composite...",
+            Command::AddContourOverlay  => "Add Contour Overlay...",
+            Command::QuerySimbad        => "Query SIMBAD Catalog",
+            Command::QueryVizier        => "Query VizieR Catalog...",
+            Command::QueryGaiaDr3       => "Query Gaia DR3",
+            Command::LoadLocalVotable   => "Load Local VOTable...",
+            Command::LineProfileTool    => "Line Profile Tool",
+            Command::PhotometryMode     => "Aperture Photometry Mode",
+            Command::ImageArithmetic    => "Image Arithmetic...",
+            Command::LoadMask           => "Load Mask File...",
+            Command::SampConnect        => "SAMP: Connect to Hub",
+            Command::SampDisconnect     => "SAMP: Disconnect",
+            Command::ToggleScriptConsole => "Toggle Script Console (Ctrl+Shift+C)",
         }
     }
 }
@@ -101,6 +130,19 @@ const ALL_COMMANDS: &[Command] = &[
     Command::AnnotationMode(ShapeType::Box),
     Command::AnnotationMode(ShapeType::Line),
     Command::AnnotationMode(ShapeType::Text),
+    Command::RgbComposite,
+    Command::AddContourOverlay,
+    Command::QuerySimbad,
+    Command::QueryVizier,
+    Command::QueryGaiaDr3,
+    Command::LoadLocalVotable,
+    Command::LineProfileTool,
+    Command::PhotometryMode,
+    Command::ImageArithmetic,
+    Command::LoadMask,
+    Command::SampConnect,
+    Command::SampDisconnect,
+    Command::ToggleScriptConsole,
 ];
 
 #[derive(Default)]
@@ -119,7 +161,6 @@ impl CommandPalette {
         self.just_opened = true;
     }
 
-    /// Render the command palette overlay. Returns the selected command if executed.
     pub fn show(&mut self, ctx: &egui::Context) -> Option<Command> {
         if !self.visible {
             return None;
@@ -136,7 +177,6 @@ impl CommandPalette {
             .fixed_size(egui::vec2(520.0, 340.0))
             .frame(theme::modal_frame())
             .show(ctx, |ui| {
-                // Search input with accent-colored bottom border effect
                 let input_resp = ui.add(
                     egui::TextEdit::singleline(&mut self.query)
                         .hint_text("Search commands…")
@@ -149,24 +189,16 @@ impl CommandPalette {
                     self.just_opened = false;
                 }
 
-                // Accent underline on input field
                 let ir = input_resp.rect;
                 ui.painter().line_segment(
                     [ir.left_bottom(), ir.right_bottom()],
                     egui::Stroke::new(2.0, theme::ACCENT),
                 );
 
-                if input_resp.lost_focus()
-                    && ctx.input(|i| i.key_pressed(egui::Key::Escape))
-                {
+                if input_resp.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                     close = true;
                 }
-
-                ctx.input(|i| {
-                    if i.key_pressed(egui::Key::Escape) {
-                        close = true;
-                    }
-                });
+                ctx.input(|i| { if i.key_pressed(egui::Key::Escape) { close = true; } });
 
                 ui.add_space(6.0);
 
@@ -186,11 +218,7 @@ impl CommandPalette {
                         self.selected = (self.selected + 1) % filtered.len();
                     }
                     if i.key_pressed(egui::Key::ArrowUp) && !filtered.is_empty() {
-                        self.selected = if self.selected == 0 {
-                            filtered.len() - 1
-                        } else {
-                            self.selected - 1
-                        };
+                        self.selected = if self.selected == 0 { filtered.len() - 1 } else { self.selected - 1 };
                     }
                     if i.key_pressed(egui::Key::Enter) {
                         if let Some(&cmd) = filtered.get(self.selected) {
@@ -203,14 +231,9 @@ impl CommandPalette {
                     ui.set_width(ui.available_width());
                     for (i, &cmd) in filtered.iter().enumerate() {
                         let is_selected = i == self.selected;
-
                         let bg = if is_selected { theme::BG_HOVER } else { egui::Color32::TRANSPARENT };
                         let text_color = if is_selected { theme::TEXT_PRIMARY } else { theme::TEXT_OVERLAY };
-
-                        let label = egui::RichText::new(cmd.label())
-                            .size(13.5)
-                            .color(text_color);
-
+                        let label = egui::RichText::new(cmd.label()).size(13.5).color(text_color);
                         let resp = egui::Frame::none()
                             .fill(bg)
                             .rounding(egui::Rounding::same(4.0))
@@ -220,16 +243,9 @@ impl CommandPalette {
                                 ui.add(egui::Label::new(label).sense(egui::Sense::click()))
                             })
                             .inner;
-
-                        if resp.hovered() {
-                            self.selected = i;
-                        }
-                        if resp.clicked() {
-                            executed = Some(cmd.clone());
-                        }
-                        if is_selected {
-                            resp.scroll_to_me(None);
-                        }
+                        if resp.hovered() { self.selected = i; }
+                        if resp.clicked() { executed = Some(cmd.clone()); }
+                        if is_selected { resp.scroll_to_me(None); }
                     }
                 });
             });

@@ -4,11 +4,15 @@ use std::sync::{Arc, OnceLock};
 
 use egui::TextureHandle;
 use fitsview_core::{
+    catalog::CatalogSource,
     colormap::Colormap,
+    composite::RgbCompositeData,
+    contour::ContourLines,
     cube_reader::FitsCube,
     event_image::EventImage,
     fits_reader::{FitsImage, HduInfo},
     mmap_reader::MmapFitsImage,
+    photometry::ApertureResult,
     region::RegionFile,
     scale::{ScaleMode, ScaleResult},
     stats::ImageStats,
@@ -17,8 +21,12 @@ use fitsview_core::{
 
 use crate::{
     annotation::Annotation,
+    catalog_overlay::CatalogOverlay,
     cube_panel::CubePanel,
+    mask_overlay::MaskOverlay,
+    photometry_tool::PhotometryTool,
     plot_panel::PlotPanel,
+    profile_tool::ProfileTool,
     viewport::ViewState,
 };
 
@@ -29,12 +37,19 @@ pub struct LargeImageState {
     pub file_id: u64,
 }
 
+pub struct RgbImageState {
+    pub composite: Arc<RgbCompositeData>,
+    /// Pre-rendered RGBA buffer (width × height × 4).
+    pub rgba: Vec<u8>,
+}
+
 pub enum FileData {
     Loading,
     Image(FitsImage),
     Event(EventImage),
     LargeImage(LargeImageState),
     Cube(Arc<FitsCube>),
+    Rgb(RgbImageState),
 }
 
 impl FileData {
@@ -45,6 +60,7 @@ impl FileData {
             FileData::Event(e) => e.width,
             FileData::LargeImage(l) => l.source.width,
             FileData::Cube(c) => c.width,
+            FileData::Rgb(r) => r.composite.width,
         }
     }
 
@@ -55,6 +71,7 @@ impl FileData {
             FileData::Event(e) => e.height,
             FileData::LargeImage(l) => l.source.height,
             FileData::Cube(c) => c.height,
+            FileData::Rgb(r) => r.composite.height,
         }
     }
 
@@ -64,7 +81,8 @@ impl FileData {
             FileData::Image(i) => &i.data,
             FileData::Event(e) => &e.data,
             FileData::LargeImage(_) => &[],
-            FileData::Cube(_) => &[], // use slice_z() directly
+            FileData::Cube(_) => &[],
+            FileData::Rgb(_) => &[],
         }
     }
 
@@ -75,24 +93,15 @@ impl FileData {
             FileData::Event(e) => &e.header,
             FileData::LargeImage(l) => &l.source.header,
             FileData::Cube(c) => &c.header,
+            FileData::Rgb(_) => EMPTY_HEADER.get_or_init(HashMap::new),
         }
     }
 
-    pub fn is_loading(&self) -> bool {
-        matches!(self, FileData::Loading)
-    }
-
-    pub fn is_event(&self) -> bool {
-        matches!(self, FileData::Event(_))
-    }
-
-    pub fn is_large(&self) -> bool {
-        matches!(self, FileData::LargeImage(_))
-    }
-
-    pub fn is_cube(&self) -> bool {
-        matches!(self, FileData::Cube(_))
-    }
+    pub fn is_loading(&self) -> bool { matches!(self, FileData::Loading) }
+    pub fn is_event(&self) -> bool   { matches!(self, FileData::Event(_)) }
+    pub fn is_large(&self) -> bool   { matches!(self, FileData::LargeImage(_)) }
+    pub fn is_cube(&self) -> bool    { matches!(self, FileData::Cube(_)) }
+    pub fn is_rgb(&self) -> bool     { matches!(self, FileData::Rgb(_)) }
 }
 
 pub struct Tab {
@@ -150,6 +159,20 @@ pub struct Tab {
     pub cube_panel: Option<CubePanel>,
     /// Shared plot panel (spectrum extraction, 1D profile)
     pub plot_panel: Option<PlotPanel>,
+    // ── Step 8 additions ─────────────────────────────────────────────
+    /// Computed contour overlays
+    pub contour_overlays: Vec<ContourLines>,
+    /// Catalog source overlays (from SIMBAD/VizieR/Gaia/VOTable)
+    pub catalogs: Vec<CatalogOverlay>,
+    /// Photometry measurements
+    pub photometry_results: Vec<ApertureResult>,
+    /// Mask (pixel-level) overlays
+    pub masks: Vec<MaskOverlay>,
+    // ── Step 9 additions ─────────────────────────────────────────────
+    /// Line profile drawing tool state
+    pub profile_tool: ProfileTool,
+    /// Aperture photometry tool state
+    pub phot_tool: PhotometryTool,
 }
 
 impl Tab {
@@ -189,6 +212,12 @@ impl Tab {
             cube_z: 0,
             cube_panel: None,
             plot_panel: None,
+            contour_overlays: Vec::new(),
+            catalogs: Vec::new(),
+            photometry_results: Vec::new(),
+            masks: Vec::new(),
+            profile_tool: ProfileTool::new(),
+            phot_tool: PhotometryTool::default(),
         }
     }
 
@@ -213,8 +242,6 @@ impl Default for TabManager {
 }
 
 impl TabManager {
-    /// Open a tab for `path` with `data`. Returns the tab id.
-    /// If a tab for this path already exists, activates it and returns its id.
     pub fn open(&mut self, path: PathBuf, data: FileData) -> u64 {
         if let Some(t) = self.tabs.iter().find(|t| t.path == path) {
             let id = t.id;
@@ -228,7 +255,14 @@ impl TabManager {
         id
     }
 
-    /// Replace a Loading tab's data once the background load completes.
+    pub fn open_with_id(&mut self, path: PathBuf, data: FileData) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.tabs.push(Tab::new(id, path, data, 0));
+        self.active_id = Some(id);
+        id
+    }
+
     pub fn finish_loading(&mut self, tab_id: u64, data: FileData, hdu_list: Vec<HduInfo>, wcs: Option<Wcs>) {
         if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
             tab.data = data;
@@ -247,7 +281,6 @@ impl TabManager {
         }
     }
 
-    /// Mark a Loading tab as having failed.
     pub fn set_load_error(&mut self, tab_id: u64, error: String) {
         if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
             tab.error = Some(error);
@@ -279,11 +312,8 @@ impl TabManager {
     }
 
     pub fn next_tab(&mut self) {
-        if self.tabs.is_empty() {
-            return;
-        }
-        let pos = self
-            .active_id
+        if self.tabs.is_empty() { return; }
+        let pos = self.active_id
             .and_then(|id| self.tabs.iter().position(|t| t.id == id))
             .unwrap_or(0);
         let next = (pos + 1) % self.tabs.len();
@@ -291,11 +321,8 @@ impl TabManager {
     }
 
     pub fn prev_tab(&mut self) {
-        if self.tabs.is_empty() {
-            return;
-        }
-        let pos = self
-            .active_id
+        if self.tabs.is_empty() { return; }
+        let pos = self.active_id
             .and_then(|id| self.tabs.iter().position(|t| t.id == id))
             .unwrap_or(0);
         let prev = if pos == 0 { self.tabs.len() - 1 } else { pos - 1 };
@@ -308,7 +335,6 @@ impl TabManager {
         }
     }
 
-    /// Draw the tab bar; returns the id that was clicked (if any).
     pub fn show_tab_bar(&mut self, ctx: &egui::Context) -> Option<u64> {
         use crate::theme;
 
@@ -353,34 +379,24 @@ impl TabManager {
                             ui.painter().rect_filled(r, egui::Rounding::ZERO, theme::BG_HOVER);
                         }
 
-                        if tab_resp.clicked() {
-                            clicked = Some(id);
-                        }
+                        if tab_resp.clicked() { clicked = Some(id); }
 
                         let close_resp = ui.add(
                             egui::Button::new(
-                                egui::RichText::new("×")
-                                    .size(14.0)
-                                    .color(theme::TEXT_MUTED),
+                                egui::RichText::new("×").size(14.0).color(theme::TEXT_MUTED),
                             )
                             .fill(fill)
                             .stroke(egui::Stroke::NONE)
                             .rounding(egui::Rounding::ZERO)
                             .min_size(egui::vec2(24.0, 34.0)),
                         );
-                        if close_resp.clicked() {
-                            close_id = Some(id);
-                        }
+                        if close_resp.clicked() { close_id = Some(id); }
 
                         let divider_rect = egui::Rect::from_min_size(
                             close_resp.rect.right_top(),
                             egui::vec2(1.0, 34.0),
                         );
-                        ui.painter().rect_filled(
-                            divider_rect,
-                            egui::Rounding::ZERO,
-                            theme::SEPARATOR,
-                        );
+                        ui.painter().rect_filled(divider_rect, egui::Rounding::ZERO, theme::SEPARATOR);
                     }
                 });
             });
@@ -407,3 +423,8 @@ impl TabManager {
         clicked
     }
 }
+
+// Suppress unused import warning for CatalogSource (used in overlay type)
+const _: fn() = || {
+    let _: &CatalogSource;
+};

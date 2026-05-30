@@ -4,11 +4,16 @@ use std::time::{Duration, Instant};
 
 use egui::{vec2, Color32, ColorImage, Rect, TextureHandle, TextureOptions, ViewportCommand};
 use fitsview_core::{
+    arithmetic::image_arithmetic,
+    catalog::CatalogSource,
     colormap::render_to_rgba,
+    composite::render_rgb_to_rgba,
+    contour::{compute_contours, sigma_levels},
     cube_reader::load_cube,
     event_image::bin_events,
     fits_reader::{list_hdus, load_fits, load_fits_hdu, HduInfo, HduType},
     mmap_reader::MmapFitsImage,
+    photometry::{aperture_photometry, header_gain, header_zero_point},
     region::load_region_file,
     scale::{build_histeq_lut, compute_scale, ScaleMode},
     session::{FileState, Session, SessionSplitLayout},
@@ -20,17 +25,26 @@ use fitsview_core::{
 
 use crate::{
     annotation::AnnotationOverlay,
+    arithmetic_panel::ArithmeticPanel,
+    catalog_overlay::{CatalogOverlay, CatalogPanel, CatalogQuery, draw_catalog},
     command_palette::{Command, CommandPalette},
+    composite_panel::CompositePanel,
+    contour_overlay::{draw_contours, ContourSettings},
     cube_panel::CubePanel,
     file_explorer::FileExplorer,
     header_panel::HeaderPanel,
     histogram_panel::{compute_histogram, HistogramPanel},
+    mask_overlay::{draw_masks, load_mask_from_fits},
+    photometry_tool::{draw_apertures, draw_preview_aperture, handle_click, show_results_panel},
+    profile_tool::{compute_and_show_profile, draw_profile_line, handle_profile_drag, show_fit_result},
     region_overlay::draw_regions,
     renderer::{create_renderer, RenderParams, Renderer},
+    samp::{SampClient, SampMessage},
+    script_console::ScriptConsole,
     split_view::{SplitLayout, SplitView},
     stats_panel::StatsPanel,
     status_bar::StatusBar,
-    tab_manager::{FileData, LargeImageState, Tab, TabManager},
+    tab_manager::{FileData, LargeImageState, RgbImageState, Tab, TabManager},
     theme,
     viewport::ViewState,
     wcs_overlay::draw_wcs_grid,
@@ -89,6 +103,25 @@ pub struct FitsViewApp {
     blink_interval_secs: f32,
     blink_last_switch: Instant,
     blink_tab_idx: usize,
+    // ── Step 8: RGB Composite + Contour + Catalog ─────────────────────
+    composite_panel: CompositePanel,
+    contour_settings: ContourSettings,
+    catalog_panel: CatalogPanel,
+    catalog_query_pending: bool,
+    #[allow(clippy::type_complexity)]
+    catalog_tx: mpsc::Sender<(u64, String, anyhow::Result<Vec<CatalogSource>>)>,
+    #[allow(clippy::type_complexity)]
+    catalog_rx: mpsc::Receiver<(u64, String, anyhow::Result<Vec<CatalogSource>>)>,
+    // ── Step 9: Analysis tools ─────────────────────────────────────────
+    arithmetic_panel: ArithmeticPanel,
+    #[allow(clippy::type_complexity)]
+    arith_tx: mpsc::Sender<(u64, usize, usize, anyhow::Result<Vec<f32>>)>,
+    #[allow(clippy::type_complexity)]
+    arith_rx: mpsc::Receiver<(u64, usize, usize, anyhow::Result<Vec<f32>>)>,
+    open_mask_input: Option<String>,
+    // ── Step 10: SAMP + Script Console ────────────────────────────────
+    samp: Option<SampClient>,
+    script_console: ScriptConsole,
 }
 
 impl FitsViewApp {
@@ -111,6 +144,8 @@ impl FitsViewApp {
         let (load_tx, load_rx) = mpsc::channel();
         let (stats_tx, stats_rx) = mpsc::channel();
         let (hist_tx, hist_rx) = mpsc::channel();
+        let (catalog_tx, catalog_rx) = mpsc::channel();
+        let (arith_tx, arith_rx) = mpsc::channel();
 
         let mut app = Self {
             tabs: TabManager::default(),
@@ -141,6 +176,18 @@ impl FitsViewApp {
             blink_interval_secs: 0.5,
             blink_last_switch: Instant::now(),
             blink_tab_idx: 0,
+            composite_panel: CompositePanel::default(),
+            contour_settings: ContourSettings::default(),
+            catalog_panel: CatalogPanel::new(),
+            catalog_query_pending: false,
+            catalog_tx,
+            catalog_rx,
+            arithmetic_panel: ArithmeticPanel::new(),
+            arith_tx,
+            arith_rx,
+            open_mask_input: None,
+            samp: None,
+            script_console: ScriptConsole::default(),
         };
 
         if let Some(dir) = initial_dir {
@@ -281,6 +328,9 @@ impl FitsViewApp {
                     tab.crosshair = !tab.crosshair;
                 }
             }
+            if i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::C) {
+                self.script_console.visible = !self.script_console.visible;
+            }
         });
 
         do_fit
@@ -367,6 +417,76 @@ impl FitsViewApp {
             Command::AnnotationMode(shape) => {
                 use crate::annotation::AnnotationMode;
                 self.annotation_overlay.mode = AnnotationMode::Placing(shape);
+            }
+            // ── Step 8 ──────────────────────────────────────────────────────────
+            Command::RgbComposite => {
+                self.composite_panel.visible = true;
+            }
+            Command::AddContourOverlay => {
+                self.contour_settings.visible = true;
+                if self.contour_settings.sigma_levels.is_empty() {
+                    self.contour_settings.sigma_levels = vec![2.0, 4.0, 8.0];
+                }
+                self.contour_settings.color = [255, 255, 0, 200];
+            }
+            Command::QuerySimbad => {
+                self.catalog_panel.visible = true;
+            }
+            Command::QueryVizier => {
+                self.catalog_panel.visible = true;
+            }
+            Command::QueryGaiaDr3 => {
+                self.catalog_panel.visible = true;
+            }
+            Command::LoadLocalVotable => {
+                self.catalog_panel.visible = true;
+            }
+            // ── Step 9 ──────────────────────────────────────────────────────────
+            Command::LineProfileTool => {
+                if let Some(tab) = self.tabs.active_tab_mut() {
+                    tab.profile_tool.active = !tab.profile_tool.active;
+                    if tab.profile_tool.active {
+                        tab.profile_tool.start = None;
+                        tab.profile_tool.end = None;
+                        tab.phot_tool.active = false;
+                    }
+                }
+            }
+            Command::PhotometryMode => {
+                if let Some(tab) = self.tabs.active_tab_mut() {
+                    tab.phot_tool.active = !tab.phot_tool.active;
+                    tab.phot_tool.results_visible = tab.phot_tool.active;
+                    if tab.phot_tool.active {
+                        tab.profile_tool.active = false;
+                    }
+                }
+            }
+            Command::ImageArithmetic => {
+                self.arithmetic_panel.visible = true;
+            }
+            Command::LoadMask => {
+                self.open_mask_input = Some(String::new());
+            }
+            // ── Step 10 ─────────────────────────────────────────────────────────
+            Command::SampConnect => {
+                if self.samp.is_none() {
+                    match SampClient::connect() {
+                        Ok(client) => {
+                            log::info!("SAMP: connected");
+                            self.samp = Some(client);
+                        }
+                        Err(e) => log::warn!("SAMP connect failed: {e}"),
+                    }
+                }
+            }
+            Command::SampDisconnect => {
+                if let Some(ref mut client) = self.samp {
+                    client.disconnect();
+                }
+                self.samp = None;
+            }
+            Command::ToggleScriptConsole => {
+                self.script_console.visible = !self.script_console.visible;
             }
         }
     }
@@ -479,6 +599,40 @@ impl FitsViewApp {
             }
         }
 
+        // Mask file dialog
+        let mut mask_to_load: Option<PathBuf> = None;
+        if let Some(ref mut input) = self.open_mask_input.clone() {
+            let mut close = false;
+            egui::Window::new("Load Mask")
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .resizable(false)
+                .collapsible(false)
+                .show(ctx, |ui| {
+                    ui.label("FITS mask file path:");
+                    ui.text_edit_singleline(input);
+                    ui.horizontal(|ui| {
+                        if ui.button("Load").clicked() {
+                            mask_to_load = Some(PathBuf::from(input.trim()));
+                            close = true;
+                        }
+                        if ui.button("Cancel").clicked() { close = true; }
+                    });
+                });
+            if close { self.open_mask_input = None; } else { self.open_mask_input = Some(input.clone()); }
+        }
+        if let Some(p) = mask_to_load {
+            match load_fits(&p) {
+                Ok(img) => {
+                    let mask = load_mask_from_fits(&img.data, img.width, img.height,
+                        p.file_name().unwrap_or_default().to_string_lossy().into_owned());
+                    if let Some(tab) = self.tabs.active_tab_mut() {
+                        tab.masks.push(mask);
+                    }
+                }
+                Err(e) => log::warn!("Failed to load mask: {e}"),
+            }
+        }
+
         // Session load dialog
         let mut session_to_load: Option<PathBuf> = None;
         if let Some(ref mut input) = self.session_load_input.clone() {
@@ -581,8 +735,48 @@ impl FitsViewApp {
             tab.view.zoom_toward(factor, cursor_rel);
         }
 
-        if response.dragged_by(egui::PointerButton::Primary) {
+        // Profile tool drag (takes priority over pan when active)
+        if tab.profile_tool.active {
+            let profile_ready = handle_profile_drag(&mut tab.profile_tool, &response, available, &tab.view);
+            if profile_ready {
+                let data = tab.data.pixel_data().to_vec();
+                let w = tab.data.width();
+                let h = tab.data.height();
+                if !data.is_empty() {
+                    let plot = tab.plot_panel.get_or_insert_with(Default::default);
+                    compute_and_show_profile(&mut tab.profile_tool, &data, w, h, plot, false);
+                }
+            }
+        } else if response.dragged_by(egui::PointerButton::Primary) {
             tab.view.pan(response.drag_delta());
+        }
+
+        // Photometry click
+        if tab.phot_tool.active {
+            if let Some((px, py)) = handle_click(&tab.phot_tool, &response, available, &tab.view) {
+                let data = tab.data.pixel_data().to_vec();
+                let w = tab.data.width();
+                let h = tab.data.height();
+                if !data.is_empty() {
+                    let gain = header_gain(tab.data.header());
+                    let zp = header_zero_point(tab.data.header());
+                    let mut result = aperture_photometry(
+                        &data, w, h, px, py,
+                        tab.phot_tool.aperture_radius,
+                        tab.phot_tool.sky_inner,
+                        tab.phot_tool.sky_outer,
+                        gain, zp,
+                    );
+                    // Attach WCS coordinates if available
+                    if let Some(ref wcs) = tab.wcs {
+                        if let Some((ra, dec)) = wcs.pixel_to_world(px, py) {
+                            result.ra = Some(ra);
+                            result.dec = Some(dec);
+                        }
+                    }
+                    tab.photometry_results.push(result);
+                }
+            }
         }
 
         // Right-drag: adjust contrast (X) and bias (Y)
@@ -647,6 +841,43 @@ impl FitsViewApp {
                     let stroke = egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(0, 255, 0, 180));
                     painter.line_segment([egui::pos2(available.min.x, screen_pos.y), egui::pos2(available.max.x, screen_pos.y)], stroke);
                     painter.line_segment([egui::pos2(screen_pos.x, available.min.y), egui::pos2(screen_pos.x, available.max.y)], stroke);
+                }
+            }
+        }
+
+        // Contour overlays
+        for contours in &tab.contour_overlays {
+            draw_contours(painter, contours, available, &tab.view);
+        }
+
+        // Catalog overlays (WCS required)
+        if let Some(ref wcs) = tab.wcs {
+            for overlay in &tab.catalogs {
+                draw_catalog(painter, overlay, wcs, available, &tab.view, ctx);
+            }
+        }
+
+        // Mask overlays
+        if !tab.masks.is_empty() {
+            draw_masks(painter, &mut tab.masks, available, &tab.view, ctx);
+        }
+
+        // Aperture photometry drawings
+        if !tab.photometry_results.is_empty() {
+            draw_apertures(painter, &tab.photometry_results, available, &tab.view);
+        }
+
+        // Profile tool line preview
+        let cursor = ctx.input(|i| i.pointer.hover_pos());
+        if available.contains(cursor.unwrap_or(egui::Pos2::ZERO)) {
+            draw_profile_line(painter, &tab.profile_tool, available, &tab.view, cursor);
+        }
+
+        // Preview aperture at cursor position
+        if tab.phot_tool.active {
+            if let Some(pos) = cursor {
+                if available.contains(pos) {
+                    draw_preview_aperture(painter, &tab.phot_tool, pos, &tab.view);
                 }
             }
         }
@@ -841,6 +1072,23 @@ impl FitsViewApp {
             }
         }
 
+        // Contour overlays on large image
+        for contours in &tab.contour_overlays {
+            draw_contours(ui.painter(), contours, available, &tab.view);
+        }
+
+        // Catalog overlays on large image
+        if let Some(ref wcs) = tab.wcs {
+            for overlay in &tab.catalogs {
+                draw_catalog(ui.painter(), overlay, wcs, available, &tab.view, ctx);
+            }
+        }
+
+        // Mask overlays
+        if !tab.masks.is_empty() {
+            draw_masks(ui.painter(), &mut tab.masks, available, &tab.view, ctx);
+        }
+
         ctx.input(|i| i.pointer.hover_pos()).and_then(|screen_pos| {
             if !response.hovered() {
                 return None;
@@ -956,6 +1204,15 @@ fn restore_session_to_app(app: &mut FitsViewApp, session: Session) {
 }
 
 fn build_texture(ctx: &egui::Context, tab: &mut Tab) -> TextureHandle {
+    // RGB composite: use pre-rendered RGBA buffer
+    if let FileData::Rgb(ref state) = tab.data {
+        let ci = ColorImage::from_rgba_unmultiplied(
+            [state.composite.width, state.composite.height],
+            &state.rgba,
+        );
+        return ctx.load_texture(format!("fits-tab-{}", tab.id), ci, TextureOptions::LINEAR);
+    }
+
     let data = tab.data.pixel_data();
     if tab.scale_result.is_none() {
         tab.scale_result = Some(compute_scale(data, tab.scale_mode));
@@ -1039,6 +1296,58 @@ impl eframe::App for FitsViewApp {
                 tab.hist_computing = false;
             }
             ctx.request_repaint();
+        }
+
+        // Drain completed catalog queries
+        while let Ok((tab_id, overlay_name, result)) = self.catalog_rx.try_recv() {
+            match result {
+                Ok(sources) => {
+                    if let Some(tab) = self.tabs.tabs.iter_mut().find(|t| t.id == tab_id) {
+                        tab.catalogs.push(CatalogOverlay::new(sources, overlay_name));
+                    }
+                }
+                Err(e) => log::warn!("Catalog query failed: {e}"),
+            }
+            self.catalog_query_pending = false;
+            ctx.request_repaint();
+        }
+
+        // Drain completed arithmetic operations
+        while let Ok((_tab_id, w, h, result)) = self.arith_rx.try_recv() {
+            match result {
+                Ok(data) => {
+                    let path = PathBuf::from("arithmetic_result.fits");
+                    let img = fitsview_core::fits_reader::FitsImage {
+                        data,
+                        width: w,
+                        height: h,
+                        header: Default::default(),
+                        bitpix: -32,
+                    };
+                    let new_id = self.tabs.open_with_id(path, FileData::Image(img));
+                    self.split_view.assign_active(new_id);
+                }
+                Err(e) => log::warn!("Arithmetic failed: {e}"),
+            }
+            ctx.request_repaint();
+        }
+
+        // Poll SAMP messages
+        if let Some(ref mut samp) = self.samp {
+            let messages = samp.poll_messages();
+            for msg in messages {
+                match msg {
+                    SampMessage::LoadImage(path) => {
+                        self.open_file(&path);
+                    }
+                    SampMessage::PointAt { ra, dec } => {
+                        log::debug!("SAMP PointAt: RA={ra} Dec={dec}");
+                    }
+                    SampMessage::LoadTable(path) => {
+                        log::debug!("SAMP LoadTable: {:?}", path);
+                    }
+                }
+            }
         }
 
         // Drain completed tile loads
@@ -1200,6 +1509,95 @@ impl eframe::App for FitsViewApp {
                 }
             }
         }
+
+        // ── Step 8: RGB Composite dialog ──────────────────────────────────────
+        if let Some(composite) = self.composite_panel.show(ctx, &self.tabs.tabs) {
+            let rgba = render_rgb_to_rgba(&composite);
+            let state = RgbImageState { composite: std::sync::Arc::new(composite), rgba };
+            let new_id = self.tabs.open_with_id(
+                PathBuf::from("rgb_composite.fits"),
+                FileData::Rgb(state),
+            );
+            self.split_view.assign_active(new_id);
+        }
+
+        // ── Step 8: Contour settings ──────────────────────────────────────────
+        let (active_mean, active_std) = self.tabs.active_tab()
+            .and_then(|t| t.stats.as_ref().map(|s| (s.mean as f32, s.std_dev as f32)))
+            .map(|(m, s)| (Some(m), Some(s)))
+            .unwrap_or((None, None));
+
+        if let Some(req) = self.contour_settings.show(ctx, active_mean, active_std) {
+            if let Some(tab) = self.tabs.active_tab_mut() {
+                if req.sigma_levels.is_empty() {
+                    tab.contour_overlays.clear();
+                } else {
+                    let levels = sigma_levels(req.mean, req.std, &req.sigma_levels, req.color);
+                    let data = tab.data.pixel_data().to_vec();
+                    let w = tab.data.width();
+                    let h = tab.data.height();
+                    if !data.is_empty() {
+                        let contours = compute_contours(&data, w, h, &levels);
+                        tab.contour_overlays.clear();
+                        tab.contour_overlays.push(contours);
+                    }
+                }
+            }
+        }
+
+        // ── Step 8: Catalog panel ─────────────────────────────────────────────
+        let wcs_center = self.tabs.active_tab().and_then(|t| {
+            let wcs = t.wcs.as_ref()?;
+            let cx = t.data.width() as f64 / 2.0;
+            let cy = t.data.height() as f64 / 2.0;
+            wcs.pixel_to_world(cx, cy)
+        });
+        if let Some(query) = self.catalog_panel.show(ctx, wcs_center) {
+            if !self.catalog_query_pending {
+                if let Some(tab_id) = self.tabs.active_id {
+                    self.catalog_query_pending = true;
+                    let tx = self.catalog_tx.clone();
+                    std::thread::spawn(move || {
+                        let result = run_catalog_query(query);
+                        let _ = tx.send((tab_id, result.0, result.1));
+                    });
+                }
+            }
+        }
+
+        // ── Step 9: Arithmetic panel ──────────────────────────────────────────
+        if let Some(req) = self.arithmetic_panel.show(ctx, &self.tabs.tabs) {
+            if let (Some(at), Some(bt)) = (self.tabs.tabs.get(req.a_idx), self.tabs.tabs.get(req.b_idx)) {
+                let a = at.data.pixel_data().to_vec();
+                let b = bt.data.pixel_data().to_vec();
+                let w = at.data.width();
+                let h = at.data.height();
+                let tx = self.arith_tx.clone();
+                std::thread::spawn(move || {
+                    let res = image_arithmetic(&a, &b, w, h, req.op, req.scale);
+                    let _ = tx.send((0, w, h, res));
+                });
+            }
+        }
+
+        // ── Step 9: Profile + Photometry tool interaction ─────────────────────
+        {
+            let active_id = self.tabs.active_id;
+            if let Some(id) = active_id {
+                if let Some(idx) = self.tabs.tabs.iter().position(|t| t.id == id) {
+                    // Profile Gaussian fit result window
+                    show_fit_result(&self.tabs.tabs[idx].profile_tool, ctx);
+
+                    // Photometry results panel
+                    let tab = &mut self.tabs.tabs[idx];
+                    let results: Vec<_> = tab.photometry_results.clone();
+                    show_results_panel(&results, &mut tab.phot_tool, ctx);
+                }
+            }
+        }
+
+        // ── Step 10: Script console ───────────────────────────────────────────
+        self.script_console.show(ctx);
 
         // Show histogram panel and apply any limit changes
         let hist_result = self.histogram_panel.show(ctx, self.tabs.active_tab());
@@ -1420,21 +1818,23 @@ impl eframe::App for FitsViewApp {
         self.cursor_image_pos = new_cursor_pos;
 
         // Annotation interaction for active tab (after CentralPanel so painter is flushed)
-        // We use a separate egui::Area to handle annotation input on the active pane
         {
             use crate::annotation::AnnotationMode;
             let is_placing = !matches!(self.annotation_overlay.mode, AnnotationMode::Disabled);
             if is_placing {
                 if let Some(id) = self.tabs.active_id {
                     if let Some(tab) = self.tabs.tabs.iter_mut().find(|t| t.id == id) {
-                        // In placing mode, the annotation_overlay tracks drag state.
-                        // We use ctx.input to check for pointer events globally.
                         let ptr = ctx.input(|i| (i.pointer.primary_down(), i.pointer.interact_pos(), i.pointer.primary_released()));
-                        let _ = (ptr, tab); // placeholder — full interaction handled in render_pane via painter
+                        let _ = (ptr, tab);
                     }
                 }
             }
         }
+
+        // Profile tool drag events (reading from egui input after render)
+        // Photometry click events
+        // These are handled indirectly: the drag/click detection is in render_pane via the Response,
+        // but we need to propagate results back. Since render_pane takes &mut Tab we handle them there.
 
         // Linked pan/zoom: propagate active pane's view to other panes
         if self.split_view.linked {
@@ -1511,6 +1911,31 @@ fn sync_linked_views(tabs: &mut [Tab], split_view: &SplitView) {
         } else {
             // Direct copy
             tab.view = active_view.clone();
+        }
+    }
+}
+
+/// Execute a catalog query on a background thread and return (name, result).
+fn run_catalog_query(query: CatalogQuery) -> (String, anyhow::Result<Vec<CatalogSource>>) {
+    match query {
+        CatalogQuery::Simbad { ra, dec, radius_arcmin, max_results } => {
+            let search = fitsview_core::catalog::ConeSearch { ra_deg: ra, dec_deg: dec, radius_arcmin, max_results };
+            ("SIMBAD".to_owned(), fitsview_core::catalog::remote::query_simbad(&search))
+        }
+        CatalogQuery::Vizier { catalog_id, ra, dec, radius_arcmin } => {
+            let search = fitsview_core::catalog::ConeSearch { ra_deg: ra, dec_deg: dec, radius_arcmin, max_results: 500 };
+            (format!("VizieR {catalog_id}"), fitsview_core::catalog::remote::query_vizier(&catalog_id, &search))
+        }
+        CatalogQuery::GaiaDr3 { ra, dec, radius_arcmin, max_results } => {
+            let search = fitsview_core::catalog::ConeSearch { ra_deg: ra, dec_deg: dec, radius_arcmin, max_results };
+            ("Gaia DR3".to_owned(), fitsview_core::catalog::remote::query_gaia_dr3(&search))
+        }
+        CatalogQuery::LocalVotable(path) => {
+            let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            let result = std::fs::read_to_string(&path)
+                .map_err(anyhow::Error::from)
+                .and_then(|xml| fitsview_core::catalog::parse_votable(&xml));
+            (name, result)
         }
     }
 }

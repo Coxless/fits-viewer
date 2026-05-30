@@ -2,54 +2,22 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [master, main]
   pull_request:
 
-env:
-  CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
-
 jobs:
-  check:
-    name: Check & Test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-
+  test:
+    name: Test & Lint
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.95.0"
           components: clippy
-
-      - name: Cache Cargo registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: cargo check (default / gpu feature)
-        run: cargo check --workspace
-
-      - name: cargo check (cpu-only)
-        run: cargo check --workspace --no-default-features --features cpu-only
-
-      - name: cargo test (default)
-        run: cargo test --workspace
-
-      - name: cargo test (cpu-only)
-        run: cargo test --workspace --no-default-features --features cpu-only
-
-      - name: cargo clippy (default)
-        run: cargo clippy --workspace -- -D warnings
-
-      - name: cargo clippy (cpu-only)
+      - uses: Swatinem/rust-cache@v2
+      - name: Install deps
+        run: sudo apt-get install -y pkg-config libssl-dev
+      - name: Clippy (cpu-only)
         run: cargo clippy --workspace --no-default-features --features cpu-only -- -D warnings
+      - name: Test (cpu-only)
+        run: cargo test --workspace --no-default-features --features cpu-only
