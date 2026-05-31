@@ -18,7 +18,7 @@ impl DirWatcher {
     pub fn new(path: &Path) -> anyhow::Result<Self> {
         let (tx, rx) = mpsc::channel();
         let mut watcher = recommended_watcher(tx)?;
-        watcher.watch(path, RecursiveMode::NonRecursive)?;
+        watcher.watch(path, RecursiveMode::Recursive)?;
         Ok(Self { _watcher: Box::new(watcher), rx })
     }
 
