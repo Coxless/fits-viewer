@@ -128,6 +128,7 @@ pub struct HistogramPanel {
 - ヒストグラムが表示され、ドラッグで vmin/vmax が変わり画像が再描画される
 - 「ZScale」ボタンで vmin/vmax が自動計算される
 - 大容量ファイル（タイルモード）でもハングしない
+- 統計パネルに **飽和ピクセル数**（ピクセル値 ≥ `DATAMAX` またはビット深度上限）が表示される（UC-02）
 
 ---
 
@@ -224,6 +225,30 @@ pub struct SplitView {
 **完了基準：**
 - `fits-view render *.fits --output-dir thumbs/ --jobs 8` が並列動作する
 - `fits-view check image.fits --assert "NAXIS == 2" --assert "BITPIX == -32"` が正しい終了コードを返す
+
+---
+
+#### 5-5. ブリンクモードの FPS 制御（UC-03）
+
+ファイル：`crates/fitsview-gui/src/app.rs`（`BlinkState` 拡張）
+
+Step 2 で実装したブリンク機能に速度制御を追加する。
+
+```rust
+pub struct BlinkState {
+    pub active: bool,
+    pub fps: f32,        // デフォルト 2.0、範囲 0.5〜10.0
+    last_flip: Instant,
+}
+```
+
+- ステータスバー右端に FPS スライダー（ブリンク中のみ表示）
+- `Ctrl+L` でブリンク ON/OFF、FPS はスライダーで変更
+- FPS 設定はセッションに保存・復元
+
+**完了基準：**
+- ブリンク FPS を 0.5〜10fps の範囲で変更でき、変更が即座に反映される
+- FPS 設定がセッションファイルに含まれ再起動後も保持される
 
 ---
 
@@ -396,6 +421,9 @@ impl Session {
   - WCS ありファイルでは座標を RA/Dec で保存（ファイル間で整合）
 - アノテーションをクリックで選択 → ラベル編集・削除
 - 色・サイズの設定パネル
+- **DS9 `.reg` 形式エクスポート**（UC-17）：コマンドパレット → "Export Regions..." で全アノテーションを `.reg` ファイルに書き出す
+  - WCS あり：`fk5` 座標系で出力
+  - WCS なし：`image` 座標系で出力
 
 #### 7-3. セッションの保存・復元
 
@@ -407,6 +435,7 @@ impl Session {
 **完了基準：**
 - セッションを保存してアプリを再起動し、同じタブ・表示設定・ズームが復元される
 - アノテーションが画像上に描画でき、セッションに保存・復元できる
+- DS9 `.reg` ファイルとしてエクスポートでき、DS9 で読み込める
 
 ---
 
@@ -497,11 +526,15 @@ pub async fn query_gaia_dr3(ra: f64, dec: f64, radius_arcmin: f64, max_results: 
 - ローカルVOTableファイルのパースも対応（`Ctrl+R` から選択）
 - シンボルクリックでオブジェクト詳細ポップアップ
 - フィルタリング：等級・タイプ・キーワード
+- **オフラインキャッシュ**（UC-09）：クエリ結果を `~/.cache/fits-view/catalogs/<hash>.json` に保存、有効期限 24時間
+  - キャッシュヒット時はネットワーク不要で即座に返す
+  - オフライン時はキャッシュがあれば使用、なければエラーではなく空リスト + 通知バナー
 
 **完了基準：**
 - 3つのタブからRGB合成画像を生成できる
 - コントゥアーが正しい位置に描画される
 - WCS付きファイルでSIMBADクエリが動作し、結果が画像上に表示される
+- ネットワーク切断状態でもキャッシュ済みクエリが正常に動作する
 
 ---
 
@@ -616,6 +649,52 @@ pub struct MaskOverlay {
 - 直線ドラッグでプロファイルが表示され、Gaussian fit が動作する
 - クリックしてフラックスが測定でき、CSVにエクスポートできる
 - 2枚のFITSを引き算して差分画像が新タブに表示される
+
+---
+
+#### 9-5. X線イベントリストのエネルギーバンドフィルター（UC-12）
+
+**目的**：Phase 1 で実装した BINTABLE イベントリスト変換を拡張し、エネルギー帯域で絞り込んでカウントマップを再生成する。Chandra / XMM-Newton データの標準的な解析手順。
+
+ファイル：`crates/fitsview-core/src/event_list.rs`（拡張）
+
+```rust
+pub struct EnergyFilter {
+    pub emin: f64,        // eV または keV（ENERGY列単位に依存）
+    pub emax: f64,
+    pub column: String,   // 自動検出："ENERGY", "PI", "PHA" の優先順
+}
+
+/// イベントをエネルギー範囲でフィルタリング
+pub fn filter_events_by_energy(
+    events: &BintableEvents,
+    filter: &EnergyFilter,
+) -> BintableEvents
+
+/// フィルタ後イベントをビニングしてカウントマップを生成
+pub fn rebin_events(
+    events: &BintableEvents,
+    width: usize,
+    height: usize,
+    bin_size: usize,
+) -> Vec<f32>
+```
+
+**エネルギー列の自動検出：**
+- `ENERGY`（keV）→ `PI`（channel integer）→ `PHA`（pulse height）の順で検索
+- 単位は `TUNIT` キーワードから読む（eV / keV / channel）
+- 検出した列名と単位をパネルヘッダに表示
+
+**UI：**
+- イベントリストが検出されたタブの下部に「Energy Filter」パネルを自動表示
+- emin / emax をデュアルスライダー + 数値入力で指定
+- "Apply" ボタンでフィルター済みイベントからカウントマップを再計算・再表示
+- 現在の選択範囲とイベント数（フィルタ前/後）をパネルに表示
+
+**完了基準：**
+- `ENERGY`（または `PI`, `PHA`）列を持つイベントリストで Energy Filter パネルが表示される
+- emin / emax を変更して "Apply" するとカウントマップが更新される
+- フィルタ適用後のカウントマップで通常の測光・プロファイル抽出が動作する
 
 ---
 
@@ -838,4 +917,39 @@ Step 12（PyO3 / パッケージング）  ← Step 11と並列可能
 
 ---
 
-*最終更新：2026-05-29 | ステータス：フェーズ1完了・Step 5 計画中*
+---
+
+## ユースケース対応表
+
+`usecases.md` の各 UC がどの Step で対応されるかの対照表。
+
+| UC | タイトル | Step / 状態 | 追加された項目 |
+|---|---|---|---|
+| UC-01 | クイックルック | ✅ Phase 1 完了 | — |
+| UC-02 | 画像品質評価 | Step 5, 9 | 飽和ピクセル数（Step 5-1 追加） |
+| UC-03 | 複数ファイル比較 | Step 5 | ブリンク FPS 制御（Step 5-5 追加） |
+| UC-04 | カラーマップ・スケール調整 | Step 5, 7 | — |
+| UC-05 | WCS座標・グリッド | Step 5 | — |
+| UC-06 | アパーチャー測光 | Step 9 | — |
+| UC-07 | RGBコンポジット | Step 8 | — |
+| UC-08 | コントゥアーオーバーレイ | Step 8 | — |
+| UC-09 | カタログオーバーレイ | Step 8 | オフラインキャッシュ（Step 8-3 追加） |
+| UC-10 | 1Dプロファイル抽出 | Step 9 | — |
+| UC-11 | データキューブ閲覧 | Step 6 | — |
+| UC-12 | X線イベントリスト | ✅ Phase 1 + Step 9 | エネルギーバンドフィルター（Step 9-5 追加） |
+| UC-13 | DS9リージョンファイル | ✅ Phase 1 完了 | — |
+| UC-14 | 画像演算 | Step 9 | — |
+| UC-15 | バッドピクセルマスク | Step 9 | — |
+| UC-16 | セッション管理 | Step 7 | — |
+| UC-17 | アノテーション | Step 7 | `.reg` エクスポート（Step 7-2 追加） |
+| UC-18 | 論文用図版書き出し | Step 10 | — |
+| UC-19 | パイプライン CI/CD | ✅ Phase 1 + Step 5 | — |
+| UC-20 | 大容量FITS閲覧 | ✅ Phase 1 完了 | — |
+| UC-21 | SAMP連携 | Step 10 | — |
+| UC-22 | スクリプトコンソール | Step 10 | — |
+| UC-23 | Pythonライブラリ | Step 12 | — |
+| UC-24 | ブラウザ版Wasm | Step 11 | — |
+
+---
+
+*最終更新：2026-05-31 | ステータス：フェーズ1完了・Step 5 計画中*
