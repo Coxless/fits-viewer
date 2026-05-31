@@ -144,7 +144,12 @@ enum Commands {
 }
 
 fn main() -> anyhow::Result<()> {
-    env_logger::init();
+    // fitsrs logs ERROR when it hits EOF while scanning for the next HDU header,
+    // which is normal behaviour for any valid single-HDU file. Silence that module
+    // so users don't see spurious red errors; the RUST_LOG env var can override.
+    env_logger::Builder::from_default_env()
+        .filter_module("fitsrs::hdu", log::LevelFilter::Off)
+        .init();
     let cli = Cli::parse();
 
     match cli.command {
