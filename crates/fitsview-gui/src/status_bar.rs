@@ -14,6 +14,7 @@ impl StatusBar {
     /// `tile_status`: `Some((pending, cache_mb))` for large-image tabs.
     /// `wcs_pos`: precomputed (ra_deg, dec_deg) for cursor position.
     /// `blink`: blink state `Some(interval_sec)` when blink is active.
+    /// Returns `Some(new_interval_secs)` when the user drags the blink FPS widget.
     pub fn show(
         ctx: &egui::Context,
         active_tab: Option<&Tab>,
@@ -21,7 +22,8 @@ impl StatusBar {
         tile_status: Option<(usize, usize)>,
         blink_interval: Option<f32>,
         linked: bool,
-    ) {
+    ) -> Option<f32> {
+        let mut new_interval: Option<f32> = None;
         egui::TopBottomPanel::bottom("status_bar")
             .frame(theme::status_bar_frame())
             .exact_height(26.0)
@@ -81,15 +83,24 @@ impl StatusBar {
                             );
                         }
 
-                        // Blink indicator
+                        // Blink indicator + FPS DragValue
                         if let Some(interval) = blink_interval {
                             ui.label(dot.clone());
                             ui.label(
-                                egui::RichText::new(format!("BLINK {interval:.1}s"))
+                                egui::RichText::new("BLINK")
                                     .monospace()
                                     .size(12.5)
                                     .color(theme::BLINK_COLOR),
                             );
+                            let mut fps = (1.0 / interval.max(f32::EPSILON)).clamp(0.5, 10.0);
+                            let dv = egui::DragValue::new(&mut fps)
+                                .range(0.5..=10.0)
+                                .speed(0.1)
+                                .max_decimals(1)
+                                .suffix(" fps");
+                            if ui.add(dv).changed() {
+                                new_interval = Some(1.0 / fps);
+                            }
                         }
 
                         // Cursor position: pixel value + optional WCS coords
@@ -184,6 +195,7 @@ impl StatusBar {
                     }
                 });
             });
+        new_interval
     }
 }
 

@@ -3,6 +3,7 @@
 pub struct ImageStats {
     pub npix: usize,
     pub n_finite: usize,
+    pub n_saturated: usize,
     pub min: f32,
     pub max: f32,
     pub mean: f64,
@@ -14,7 +15,7 @@ pub struct ImageStats {
 /// Compute statistics over a pixel buffer. NaN and Inf values are excluded.
 pub fn compute_stats(data: &[f32]) -> ImageStats {
     if data.is_empty() {
-        return ImageStats { npix: 0, n_finite: 0, min: 0.0, max: 0.0, mean: 0.0, median: 0.0, std_dev: 0.0, sum: 0.0 };
+        return ImageStats { npix: 0, n_finite: 0, n_saturated: 0, min: 0.0, max: 0.0, mean: 0.0, median: 0.0, std_dev: 0.0, sum: 0.0 };
     }
 
     let mut finite: Vec<f32> = data.iter().copied().filter(|v| v.is_finite()).collect();
@@ -22,7 +23,7 @@ pub fn compute_stats(data: &[f32]) -> ImageStats {
     let n_finite = finite.len();
 
     if n_finite == 0 {
-        return ImageStats { npix, n_finite: 0, min: f32::NAN, max: f32::NAN, mean: f64::NAN, median: f32::NAN, std_dev: f64::NAN, sum: 0.0 };
+        return ImageStats { npix, n_finite: 0, n_saturated: 0, min: f32::NAN, max: f32::NAN, mean: f64::NAN, median: f32::NAN, std_dev: f64::NAN, sum: 0.0 };
     }
 
     // Min/max
@@ -52,7 +53,9 @@ pub fn compute_stats(data: &[f32]) -> ImageStats {
         (finite[n_finite / 2 - 1] as f64 + finite[n_finite / 2] as f64) as f32 / 2.0
     };
 
-    ImageStats { npix, n_finite, min: vmin, max: vmax, mean, median, std_dev, sum }
+    let n_saturated = data.iter().filter(|&&v| v == vmax).count();
+
+    ImageStats { npix, n_finite, n_saturated, min: vmin, max: vmax, mean, median, std_dev, sum }
 }
 
 #[cfg(test)]
@@ -70,6 +73,7 @@ mod tests {
         assert!((s.mean - 2.0).abs() < 1e-10);
         assert_eq!(s.median, 2.0);
         assert!((s.std_dev - 2.0f64.sqrt()).abs() < 1e-6, "stddev: {}", s.std_dev);
+        assert_eq!(s.n_saturated, 1); // only 4.0 is at max
     }
 
     #[test]

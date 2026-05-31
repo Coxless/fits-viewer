@@ -1173,6 +1173,7 @@ fn build_session_from_app(app: &FitsViewApp) -> Session {
             pane_paths,
             linked: app.split_view.linked,
         },
+        blink_interval_secs: app.blink_interval_secs,
     }
 }
 
@@ -1201,6 +1202,7 @@ fn restore_session_to_app(app: &mut FitsViewApp, session: Session) {
         _ => app.split_view.set_layout(SplitLayout::Single),
     }
     app.split_view.linked = session.split.linked;
+    app.blink_interval_secs = session.blink_interval_secs;
 }
 
 fn build_texture(ctx: &egui::Context, tab: &mut Tab) -> TextureHandle {
@@ -1652,7 +1654,9 @@ impl eframe::App for FitsViewApp {
         };
 
         let blink_info = if self.blink_enabled { Some(self.blink_interval_secs) } else { None };
-        StatusBar::show(ctx, self.tabs.active_tab(), self.cursor_image_pos, tile_status, blink_info, self.split_view.linked);
+        if let Some(new_interval) = StatusBar::show(ctx, self.tabs.active_tab(), self.cursor_image_pos, tile_status, blink_info, self.split_view.linked) {
+            self.blink_interval_secs = new_interval;
+        }
         self.tabs.show_tab_bar(ctx);
 
         // Show cube panel (bottom panel) before CentralPanel for the active cube tab
