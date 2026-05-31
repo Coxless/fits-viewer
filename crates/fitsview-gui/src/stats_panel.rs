@@ -40,6 +40,7 @@ impl StatsPanel {
                             stat_row(ui, "Height", &format!("{img_height} px"));
                             stat_row(ui, "Total pixels",  &format!("{}", s.npix));
                             stat_row(ui, "Valid pixels",  &format!("{}", s.n_finite));
+                            stat_row(ui, "Saturated px",  &format!("{}", s.n_saturated));
                             stat_row(ui, "Minimum",  &format!("{:.6}", s.min));
                             stat_row(ui, "Maximum",  &format!("{:.6}", s.max));
                             stat_row(ui, "Mean",     &format!("{:.6}", s.mean));

@@ -50,6 +50,12 @@ pub struct Session {
     pub version: u32,
     pub files: Vec<FileState>,
     pub split: SessionSplitLayout,
+    #[serde(default = "default_blink_interval")]
+    pub blink_interval_secs: f32,
+}
+
+fn default_blink_interval() -> f32 {
+    0.5
 }
 
 impl Session {
