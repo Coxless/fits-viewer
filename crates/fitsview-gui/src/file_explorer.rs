@@ -255,7 +255,7 @@ fn build_tree(dir: &Path, expanded: &HashSet<PathBuf>) -> Vec<TreeNode> {
         .into_iter()
         .flatten()
         .filter_map(|e| e.ok())
-        .filter_map(|e| {
+        .map(|e| {
             let path = e.path();
             if path.is_dir() {
                 let children = if expanded.contains(&path) {
@@ -263,9 +263,9 @@ fn build_tree(dir: &Path, expanded: &HashSet<PathBuf>) -> Vec<TreeNode> {
                 } else {
                     Vec::new()
                 };
-                Some(TreeNode { path, kind: NodeKind::Dir(children) })
+                TreeNode { path, kind: NodeKind::Dir(children) }
             } else {
-                Some(TreeNode { path, kind: NodeKind::File })
+                TreeNode { path, kind: NodeKind::File }
             }
         })
         .collect();
